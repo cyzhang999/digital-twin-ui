@@ -167,7 +167,8 @@ export function executeModelCommand(command: any) {
     switch (command.action) {
       case 'rotate':
         if (typeof window.rotateModel === 'function') {
-          result = window.rotateModel(command.target, command.direction, command.angle) || { success: false };
+          const rotateResult = window.rotateModel({ target: command.target, direction: command.direction, angle: command.angle });
+          result = typeof rotateResult === 'boolean' ? { success: rotateResult, error: '' } : (rotateResult || { success: false, error: '执行失败' });
         } else {
           result = { success: false, error: 'rotateModel函数未定义' };
         }
@@ -175,7 +176,8 @@ export function executeModelCommand(command: any) {
         
       case 'zoom':
         if (typeof window.zoomModel === 'function') {
-          result = window.zoomModel(command.target, command.scale) || { success: false };
+          const zoomResult = window.zoomModel({ target: command.target, scale: command.scale });
+          result = typeof zoomResult === 'boolean' ? { success: zoomResult, error: '' } : (zoomResult || { success: false, error: '执行失败' });
         } else {
           result = { success: false, error: 'zoomModel函数未定义' };
         }
@@ -183,7 +185,8 @@ export function executeModelCommand(command: any) {
         
       case 'focus':
         if (typeof window.focusOnModel === 'function') {
-          result = window.focusOnModel(command.target) || { success: false };
+          const focusResult = window.focusOnModel({ target: command.target });
+          result = typeof focusResult === 'boolean' ? { success: focusResult, error: '' } : (focusResult || { success: false, error: '执行失败' });
         } else {
           result = { success: false, error: 'focusOnModel函数未定义' };
         }
@@ -191,7 +194,8 @@ export function executeModelCommand(command: any) {
         
       case 'reset':
         if (typeof window.resetModel === 'function') {
-          result = window.resetModel() || { success: false };
+          const resetResult = window.resetModel();
+          result = typeof resetResult === 'boolean' ? { success: resetResult, error: '' } : (resetResult || { success: false, error: '执行失败' });
         } else {
           result = { success: false, error: 'resetModel函数未定义' };
         }

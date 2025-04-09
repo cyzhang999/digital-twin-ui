@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue';
+import { ref, onMounted, onBeforeUnmount } from 'vue';
 import ModelViewer from './components/ModelViewer.vue';
 import ChatDialog from './components/ChatDialog.vue';
 
@@ -8,6 +8,151 @@ const modelViewerRef = ref<InstanceType<typeof ModelViewer> | null>(null);
 
 // 聊天对话框显示状态 (Chat dialog display state)
 const chatDialogVisible = ref(false);
+
+// 添加WebSocket连接管理
+const wsManager = {
+  statusSocket: null,
+  healthSocket: null,
+  reconnectAttempts: 0,
+  maxReconnectAttempts: 5,
+  reconnectDelay: 3000, // 3秒
+  
+  connectStatus: async () => {
+    try {
+      const wsUrl = import.meta.env.VITE_PYTHON_WS_URL || 'ws://localhost:9000';
+      
+      // 如果已经有连接，先关闭
+      if (wsManager.statusSocket) {
+        try {
+          wsManager.statusSocket.close();
+        } catch (e) {
+          console.warn('关闭旧WebSocket连接时出错:', e);
+        }
+      }
+      
+      // 创建新的WebSocket连接
+      console.log('正在连接状态WebSocket:', `${wsUrl}/ws/status`);
+      wsManager.statusSocket = new WebSocket(`${wsUrl}/ws/status`);
+      
+      wsManager.statusSocket.onopen = () => {
+        console.log('WebSocket状态连接成功');
+        wsManager.reconnectAttempts = 0; // 重置尝试次数
+      };
+      
+      wsManager.statusSocket.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'status') {
+            console.log('WebSocket状态更新:', data.data);
+            // 更新应用状态
+            appStatus.value = data.data;
+          }
+        } catch (e) {
+          console.error('解析WebSocket状态消息失败:', e);
+        }
+      };
+      
+      wsManager.statusSocket.onerror = (error) => {
+        console.error('WebSocket状态连接错误:', error);
+        appStatus.value = { connected: false };
+      };
+      
+      wsManager.statusSocket.onclose = () => {
+        console.warn('WebSocket状态连接已关闭');
+        appStatus.value = { connected: false };
+        
+        // 尝试重连
+        if (wsManager.reconnectAttempts < wsManager.maxReconnectAttempts) {
+          wsManager.reconnectAttempts++;
+          console.log(`尝试重新连接状态WebSocket (${wsManager.reconnectAttempts}/${wsManager.maxReconnectAttempts})...`);
+          setTimeout(() => wsManager.connectStatus(), wsManager.reconnectDelay);
+        } else {
+          console.error('达到最大重连次数，停止尝试连接WebSocket状态');
+        }
+      };
+    } catch (error) {
+      console.error('WebSocket状态连接失败:', error);
+      appStatus.value = { connected: false };
+    }
+  },
+  
+  connectHealth: async () => {
+    try {
+      const wsUrl = import.meta.env.VITE_PYTHON_WS_URL || 'ws://localhost:9000';
+      
+      // 如果已经有连接，先关闭
+      if (wsManager.healthSocket) {
+        try {
+          wsManager.healthSocket.close();
+        } catch (e) {
+          console.warn('关闭旧WebSocket连接时出错:', e);
+        }
+      }
+      
+      // 创建新的WebSocket连接
+      console.log('正在连接健康检查WebSocket:', `${wsUrl}/ws/health`);
+      wsManager.healthSocket = new WebSocket(`${wsUrl}/ws/health`);
+      
+      wsManager.healthSocket.onopen = () => {
+        console.log('WebSocket健康检查连接成功');
+      };
+      
+      wsManager.healthSocket.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'health') {
+            console.log('WebSocket健康检查:', data);
+            // 更新健康状态
+            healthStatus.value = data;
+          }
+        } catch (e) {
+          console.error('解析WebSocket健康检查消息失败:', e);
+        }
+      };
+      
+      wsManager.healthSocket.onerror = (error) => {
+        console.error('WebSocket健康检查连接错误:', error);
+        healthStatus.value = { status: 'error', message: '连接失败' };
+      };
+      
+      wsManager.healthSocket.onclose = () => {
+        console.warn('WebSocket健康检查连接已关闭');
+        healthStatus.value = { status: 'error', message: '连接已关闭' };
+        
+        // 这里可以添加健康检查的重连逻辑，或者仅在状态连接被关闭时重连
+      };
+    } catch (error) {
+      console.error('WebSocket健康检查连接失败:', error);
+      healthStatus.value = { status: 'error', message: '连接失败' };
+    }
+  },
+  
+  disconnect: () => {
+    if (wsManager.statusSocket) {
+      try {
+        wsManager.statusSocket.close();
+      } catch (e) {
+        console.warn('关闭状态WebSocket时出错:', e);
+      }
+      wsManager.statusSocket = null;
+    }
+    
+    if (wsManager.healthSocket) {
+      try {
+        wsManager.healthSocket.close();
+      } catch (e) {
+        console.warn('关闭健康检查WebSocket时出错:', e);
+      }
+      wsManager.healthSocket = null;
+    }
+    
+    console.log('已断开所有WebSocket连接');
+  }
+};
+
+// 替换HTTP请求为WebSocket连接
+const appStatus = ref({ connected: false });
+const healthStatus = ref({ status: 'unknown', message: '初始化中' });
 
 // 打开聊天对话框 (Open chat dialog)
 const openChatDialog = () => {
@@ -110,6 +255,43 @@ const handleChatAction = (action) => {
     console.warn(`未知操作类型: ${action.type || action.operation}`);
   }
 };
+
+// 修改生命周期钩子，连接WebSocket
+onMounted(async () => {
+  // 连接WebSocket
+  await wsManager.connectStatus();
+  await wsManager.connectHealth();
+  
+  // 不再使用HTTP请求检查状态
+  // checkStatus();
+  // setInterval(checkStatus, 30000);
+});
+
+// 修改组件卸载前的清理
+onBeforeUnmount(() => {
+  // 断开WebSocket连接
+  wsManager.disconnect();
+  
+  // 清除定时器
+  if (statusCheckInterval) {
+    clearInterval(statusCheckInterval);
+  }
+});
+
+// 移除或注释掉checkStatus函数
+/*
+const checkStatus = async () => {
+  try {
+    const pythonServiceUrl = import.meta.env.VITE_PYTHON_SERVICE_URL || 'http://localhost:9000';
+    const response = await fetch(`${pythonServiceUrl}/api/websocket/status`);
+    const data = await response.json();
+    appStatus.value = data;
+  } catch (error) {
+    console.error('获取状态失败:', error);
+    appStatus.value = { connected: false };
+  }
+};
+*/
 </script>
 
 <template>

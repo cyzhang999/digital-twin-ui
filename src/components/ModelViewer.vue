@@ -132,6 +132,84 @@ const openDatabase = (): Promise<IDBDatabase> => {
   });
 };
 
+// 全局暴露THREE.js对象，确保后端可以直接访问
+const exposeThreeJSObjects = () => {
+  if (scene && camera && renderer && controls) {
+    console.log('正在全局暴露THREE.js对象...');
+    window.__scene = scene;
+    window.__camera = camera;
+    window.__renderer = renderer;
+    window.__controls = controls;
+    
+    // 为了调试目的
+    console.log('THREE.js对象已全局暴露:', {
+      scene: !!window.__scene,
+      camera: !!window.__camera,
+      renderer: !!window.__renderer,
+      controls: !!window.__controls
+    });
+  } else {
+    console.warn('无法暴露THREE.js对象，部分对象未初始化');
+  }
+};
+
+// 添加WebSocket连接管理
+const wsManager = {
+  statusSocket: null as WebSocket | null,
+  healthSocket: null as WebSocket | null,
+  
+  connectStatus: async () => {
+    try {
+      const wsUrl = import.meta.env.VITE_PYTHON_WS_URL || 'ws://localhost:9000';
+      wsManager.statusSocket = new WebSocket(`${wsUrl}/ws/status`);
+      
+      wsManager.statusSocket.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        if (data.type === 'status') {
+          console.log('WebSocket状态更新:', data.data);
+        }
+      };
+      
+      wsManager.statusSocket.onerror = (error) => {
+        console.error('WebSocket状态连接错误:', error);
+      };
+    } catch (error) {
+      console.error('WebSocket状态连接失败:', error);
+    }
+  },
+  
+  connectHealth: async () => {
+    try {
+      const wsUrl = import.meta.env.VITE_PYTHON_WS_URL || 'ws://localhost:9000';
+      wsManager.healthSocket = new WebSocket(`${wsUrl}/ws/health`);
+      
+      wsManager.healthSocket.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        if (data.type === 'health') {
+          console.log('WebSocket健康检查:', data);
+        }
+      };
+      
+      wsManager.healthSocket.onerror = (error) => {
+        console.error('WebSocket健康检查连接错误:', error);
+      };
+    } catch (error) {
+      console.error('WebSocket健康检查连接失败:', error);
+    }
+  },
+  
+  disconnect: () => {
+    if (wsManager.statusSocket) {
+      wsManager.statusSocket.close();
+      wsManager.statusSocket = null;
+    }
+    if (wsManager.healthSocket) {
+      wsManager.healthSocket.close();
+      wsManager.healthSocket = null;
+    }
+  }
+};
+
 // 初始化场景 (Initialize scene)
 const initScene = () => {
   if (!canvasRef.value) return;
@@ -151,7 +229,8 @@ const initScene = () => {
   // 设置相机 (Setup camera)
   const aspectRatio = canvasRef.value.clientWidth / canvasRef.value.clientHeight;
   camera = new THREE.PerspectiveCamera(75, aspectRatio, 0.1, 1000);
-  camera.position.z = 5;
+  camera.position.set(0, 5, 10);
+  window.__defaultCameraPosition = camera.position.clone();
   
   // 设置渲染器 (Setup renderer)
   renderer = new THREE.WebGLRenderer({
@@ -165,10 +244,68 @@ const initScene = () => {
   controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true;
   controls.dampingFactor = 0.05;
+  controls.screenSpacePanning = false;
+  controls.minDistance = 1;
+  controls.maxDistance = 50;
+  controls.maxPolarAngle = Math.PI / 2;
   
-  // 将控制器引用保存到canvas元素上，便于外部访问
-  // (Save controls reference on canvas element for external access)
-  canvasRef.value.__controls = controls;
+  // 暴露ThreeJS对象 - 确保在所有对象初始化完成后调用
+  // 修改旋转方法实现，避免递归调用和undefined错误
+  // 保存原始方法的引用（如果存在）
+  const originalRotateLeft = controls.rotateLeft;
+  const originalRotateRight = controls.rotateRight;
+  const originalRotateUp = controls.rotateUp;
+  const originalRotateDown = controls.rotateDown;
+  
+  // 重新定义旋转方法，确保即使原始方法不存在也不会报错
+  controls.rotateLeft = function(angle) {
+    const rotSpeed = 0.05;
+    // 检查原始方法是否存在
+    if (typeof originalRotateLeft === 'function') {
+      originalRotateLeft.call(this, angle * rotSpeed);
+    } else {
+      // 降级方案：直接使用Three.js的矩阵旋转
+      const rotationMatrix = new THREE.Matrix4().makeRotationY(angle * rotSpeed);
+      this.object.position.applyMatrix4(rotationMatrix);
+      this.update();
+    }
+  };
+  
+  controls.rotateRight = function(angle) {
+    const rotSpeed = 0.05;
+    if (typeof originalRotateRight === 'function') {
+      originalRotateRight.call(this, angle * rotSpeed);
+    } else {
+      const rotationMatrix = new THREE.Matrix4().makeRotationY(-angle * rotSpeed);
+      this.object.position.applyMatrix4(rotationMatrix);
+      this.update();
+    }
+  };
+  
+  controls.rotateUp = function(angle) {
+    const rotSpeed = 0.05;
+    if (typeof originalRotateUp === 'function') {
+      originalRotateUp.call(this, angle * rotSpeed);
+    } else {
+      const rotationMatrix = new THREE.Matrix4().makeRotationX(angle * rotSpeed);
+      this.object.position.applyMatrix4(rotationMatrix);
+      this.update();
+    }
+  };
+  
+  controls.rotateDown = function(angle) {
+    const rotSpeed = 0.05;
+    if (typeof originalRotateDown === 'function') {
+      originalRotateDown.call(this, angle * rotSpeed);
+    } else {
+      const rotationMatrix = new THREE.Matrix4().makeRotationX(-angle * rotSpeed);
+      this.object.position.applyMatrix4(rotationMatrix);
+      this.update();
+    }
+  };
+  
+  // 暴露ThreeJS对象
+  exposeThreeJSObjects();
   
   // 初始化射线检测器和鼠标位置 (Initialize raycaster and mouse position)
   raycaster = new THREE.Raycaster();
@@ -684,6 +821,10 @@ onMounted(async () => {
   initScene();
   await loadModel();
   
+  // 连接WebSocket
+  await wsManager.connectStatus();
+  await wsManager.connectHealth();
+  
   // 注册默认动画
   animationManager.register('default', () => {
     if (model) {
@@ -700,211 +841,118 @@ onMounted(async () => {
     console.error('MCP客户端初始化失败:', error);
   }
   
-  // 将模型操作方法暴露给全局window对象
-  window.rotateModel = function({ direction = 'left', angle = 45, target = null }) {
-    console.log(`执行旋转: direction=${direction}, angle=${angle}, target=${target}`);
-    
+  // 修改旋转模型方法，增加更多的错误处理
+  window.rotateModel = function(params) {
     try {
-      // 使用OrbitControls进行旋转
-      if (window.__orbitControls) {
-        const rotateAmount = (direction === 'left' ? 1 : -1) * (angle * Math.PI / 180);
-        window.__orbitControls.rotateLeft(rotateAmount);
-        window.__orbitControls.update();
-        
-        // 广播旋转事件，供其他组件使用
-        const event = new CustomEvent('model:rotated', {
-          detail: { direction, angle, target }
+      console.log('rotateModel方法被调用，参数:', params);
+      const angle = params?.angle || 45;
+      const direction = params?.direction || 'left';
+      const radians = angle * Math.PI / 180;
+      const rotationSpeed = 0.05;
+
+      if (!camera || !controls || !renderer || !scene) {
+        console.error('THREE.js对象未完全初始化', {
+          camera: !!camera,
+          controls: !!controls,
+          renderer: !!renderer,
+          scene: !!scene
         });
-        window.dispatchEvent(event);
-        
-        return true;
+        return { success: false, error: 'THREE.js对象未完全初始化' };
       }
+
+      console.log(`执行旋转: 方向=${direction}, 角度=${angle}度, 弧度=${radians.toFixed(4)}`);
       
-      // 如果没有OrbitControls但有全局app对象
-      if (window.app && typeof window.app.rotateComponent === 'function') {
-        const result = window.app.rotateComponent(target, angle, direction);
-        return result.success;
+      // 直接使用相机位置旋转方式
+      if (direction === 'left') {
+        const rotateAxis = new THREE.Vector3(0, 1, 0);
+        camera.position.applyAxisAngle(rotateAxis, radians * rotationSpeed);
+        console.log('相机位置已更新 - 向左旋转');
+      } else if (direction === 'right') {
+        const rotateAxis = new THREE.Vector3(0, 1, 0);
+        camera.position.applyAxisAngle(rotateAxis, -radians * rotationSpeed);
+        console.log('相机位置已更新 - 向右旋转');
+      } else if (direction === 'up') {
+        const rotateAxis = new THREE.Vector3(1, 0, 0);
+        camera.position.applyAxisAngle(rotateAxis, radians * rotationSpeed);
+        console.log('相机位置已更新 - 向上旋转');
+      } else if (direction === 'down') {
+        const rotateAxis = new THREE.Vector3(1, 0, 0);
+        camera.position.applyAxisAngle(rotateAxis, -radians * rotationSpeed);
+        console.log('相机位置已更新 - 向下旋转');
       }
+
+      controls.update();
+      console.log('控制器已更新');
       
-      console.error('找不到可用的旋转方法');
-      return false;
-    } catch (error) {
-      console.error('执行旋转操作出错:', error);
-      return false;
+      renderer.render(scene, camera);
+      console.log('场景已重新渲染');
+
+      console.log('旋转操作完成');
+      return { success: true, executed: true };
+    } catch(e) {
+      console.error('旋转操作失败:', e);
+      return { success: false, error: e.toString() };
     }
   };
   
-  window.zoomModel = function({ scale = 1.5, target = null }) {
-    console.log(`执行缩放: scale=${scale}, target=${target}`);
-    
+  window.zoomModel = function(params) {
     try {
-      // 使用OrbitControls进行缩放
-      if (window.__orbitControls) {
-        if (scale > 1) {
-          window.__orbitControls.dollyIn(scale);
-        } else if (scale < 1) {
-          window.__orbitControls.dollyOut(1/scale);
-        }
-        window.__orbitControls.update();
-        
-        // 广播缩放事件，供其他组件使用
-        const event = new CustomEvent('model:zoomed', {
-          detail: { scale, target }
-        });
-        window.dispatchEvent(event);
-        
-        return true;
-      }
-      
-      // 如果没有OrbitControls但有全局app对象
-      if (window.app && typeof window.app.zoomComponent === 'function') {
-        const result = window.app.zoomComponent(target, scale);
-        return result.success;
-      }
-      
-      console.error('找不到可用的缩放方法');
-      return false;
-    } catch (error) {
-      console.error('执行缩放操作出错:', error);
-      return false;
-    }
-  };
-  
-  window.focusOnModel = function({ target = 'center' }) {
-    console.log(`执行聚焦: target=${target}`);
-    
-    try {
-      // 取消之前的动画
-      if (window.__focusAnimationId) {
-        cancelAnimationFrame(window.__focusAnimationId);
-        window.__focusAnimationId = undefined;
-      }
-      
-      // 如果没有场景或控制器，直接返回
-      if (!window.scene || !window.__orbitControls) {
-        console.error('无法执行聚焦：场景或控制器未初始化');
-        return false;
-      }
-      
-      // 查找目标对象
-      let targetPosition;
-      
-      if (target === 'center') {
-        // 默认聚焦到中心
-        targetPosition = new THREE.Vector3(0, 0, 0);
+      const scale = params?.scale || 1.5;
+
+      if (scale > 1) {
+        controls.dollyIn(scale);
       } else {
-        // 查找特定的对象
-        let targetObject = null;
-        
-        // 使用不同的匹配方式查找目标
-        window.scene.traverse((object) => {
-          if (targetObject) return;
-          
-          // 完全匹配
-          if (object.name === target) {
-            targetObject = object;
-            return;
-          }
-          
-          // 不区分大小写的匹配
-          if (object.name.toLowerCase() === target.toLowerCase()) {
-            targetObject = object;
-            return;
-          }
-          
-          // 包含匹配
-          if (object.name.includes(target) || object.name.toLowerCase().includes(target.toLowerCase())) {
-            targetObject = object;
-            return;
-          }
-        });
-        
-        if (targetObject) {
-          targetPosition = new THREE.Vector3();
-          targetObject.getWorldPosition(targetPosition);
-        } else {
-          console.warn(`未找到目标对象: ${target}，使用中心点替代`);
-          targetPosition = new THREE.Vector3(0, 0, 0);
-        }
+        controls.dollyOut(1/scale);
       }
-      
-      // 创建动画
-      const startPosition = window.__orbitControls.target.clone();
-      const endPosition = targetPosition;
-      const duration = 1000; // 1秒动画
-      const startTime = Date.now();
-      
-      // 缓动函数
-      function easeOutCubic(x) {
-        return 1 - Math.pow(1 - x, 3);
-      }
-      
-      // 动画函数
-      function animate() {
-        const elapsed = Date.now() - startTime;
-        const progress = Math.min(elapsed / duration, 1);
-        
-        // 使用缓动函数使动画更自然
-        const easeProgress = easeOutCubic(progress);
-        
-        // 计算当前位置
-        const currentPosition = new THREE.Vector3().lerpVectors(
-          startPosition, endPosition, easeProgress
-        );
-        
-        // 更新目标位置
-        window.__orbitControls.target.copy(currentPosition);
-        window.__orbitControls.update();
-        
-        // 继续动画或结束
-        if (progress < 1) {
-          window.__focusAnimationId = requestAnimationFrame(animate);
-        } else {
-          window.__focusAnimationId = undefined;
-          
-          // 广播聚焦完成事件
-          const event = new CustomEvent('model:focused', {
-            detail: { target, position: endPosition }
-          });
-          window.dispatchEvent(event);
-        }
-      }
-      
-      // 开始动画
-      window.__focusAnimationId = requestAnimationFrame(animate);
-      return true;
-    } catch (error) {
-      console.error('执行聚焦操作出错:', error);
-      return false;
+
+      controls.update();
+      renderer.render(scene, camera);
+
+      return { success: true, executed: true };
+    } catch(e) {
+      console.error('缩放操作失败:', e);
+      return { success: false, error: e.toString() };
     }
   };
   
-  window.resetModel = function(params = {}) {
-    console.log('执行重置操作');
-    
+  window.focusOnModel = function(params) {
     try {
-      // 使用OrbitControls进行重置
-      if (window.__orbitControls) {
-        window.__orbitControls.reset();
-        
-        // 广播重置事件，供其他组件使用
-        const event = new CustomEvent('model:reset');
-        window.dispatchEvent(event);
-        
-        return true;
+      const target = params?.target || 'center';
+
+      if (target === 'center') {
+        controls.target.set(0, 0, 0);
+      } else {
+        const targetObject = scene.getObjectByName(target);
+        if (targetObject) {
+          const box = new THREE.Box3().setFromObject(targetObject);
+          const center = box.getCenter(new THREE.Vector3());
+          controls.target.copy(center);
+        } else {
+          throw new Error(`未找到目标对象: ${target}`);
+        }
       }
-      
-      // 如果没有OrbitControls但有全局app对象
-      if (window.app && typeof window.app.resetModel === 'function') {
-        const result = window.app.resetModel();
-        return result;
-      }
-      
-      console.error('找不到可用的重置方法');
-      return false;
-    } catch (error) {
-      console.error('执行重置操作出错:', error);
-      return false;
+
+      controls.update();
+      renderer.render(scene, camera);
+
+      return { success: true, executed: true };
+    } catch(e) {
+      console.error('聚焦操作失败:', e);
+      return { success: false, error: e.toString() };
+    }
+  };
+  
+  window.resetModel = function() {
+    try {
+      camera.position.copy(window.__defaultCameraPosition);
+      controls.target.set(0, 0, 0);
+      controls.update();
+      renderer.render(scene, camera);
+
+      return { success: true, executed: true };
+    } catch(e) {
+      console.error('重置操作失败:', e);
+      return { success: false, error: e.toString() };
     }
   };
   
@@ -981,6 +1029,9 @@ onBeforeUnmount(() => {
   // 清理动画状态
   animationManager.states.clear();
   animationManager.animations.clear();
+  
+  // 断开WebSocket连接
+  wsManager.disconnect();
 });
 
 // 对外暴露的控制方法，供外部API调用 (Exposed control methods for external API calls)
