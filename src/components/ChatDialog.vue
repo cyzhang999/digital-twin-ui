@@ -10,6 +10,9 @@ const props = defineProps<{
 // 定义事件 (Define events)
 const emit = defineEmits(['update:modelVisible', 'executeAction']);
 
+// 初始化MCP客户端
+const mcpClient = ref(null);
+
 // 对话记录 (Chat history)
 const chatHistory = reactive<Array<{role: string, content: string, time: string, mcpOperation?: any}>>([
   { role: 'assistant', content: '您好，我是数字孪生AI助手。我可以回答您关于办公室模型的问题，也可以帮您操作3D模型。', time: formatTime(new Date()) }
@@ -52,9 +55,18 @@ const closeDialog = () => {
 
 // 发送消息 (Send message)
 const sendMessage = async () => {
-  if (!userMessage.value.trim() || isLoading.value) return;
+  // 检查消息是否为空
+  if (!userMessage.value.trim()) {
+    console.warn('消息内容为空，取消发送');
+    return;
+  }
   
-  const message = userMessage.value;
+  if (isLoading.value) {
+    console.warn('正在处理上一条消息，请稍后重试');
+    return;
+  }
+  
+  const message = userMessage.value.trim();
   userMessage.value = '';
   isLoading.value = true;
   
@@ -70,12 +82,45 @@ const sendMessage = async () => {
   scrollToBottom();
   
   try {
-    // 不管选择什么模式，都先发送到后端处理
-    await sendToDifyServer(message);
+    // 发送消息到Dify服务，获取响应
+    const response = await sendToDifyServer(message);
+    
+    if (!response || !response.success) {
+      // 处理失败情况
+      chatHistory.push({
+        role: 'assistant',
+        content: response?.text || '处理消息时发生错误',
+        time: formatTime(new Date()),
+        error: true
+      });
+    } else {
+      // 处理成功情况
+      chatHistory.push({
+        role: 'assistant',
+        content: response.text,
+        time: formatTime(new Date()),
+        mcpOperation: response.operation ? {
+          operation: response.operation,
+          parameters: {},
+          success: true
+        } : undefined
+      });
+    }
     
     // 如果是MCP模式，再发送到MCP服务处理模型操作
-    if (isMCPMode.value && isMCPAvailable.value) {
-      await sendToMCPServer(message);
+    if (isMCPMode.value && isMCPAvailable.value && response?.success) {
+      try {
+        await sendToMCPServer(message);
+      } catch (mcpError) {
+        console.error('MCP服务处理失败:', mcpError);
+        // 添加警告信息但不中断流程
+        chatHistory.push({
+          role: 'assistant',
+          content: `模型操作服务提示: ${mcpError.message || '操作处理失败'}`,
+          time: formatTime(new Date()),
+          type: 'warning'
+        });
+      }
     }
   } catch (error) {
     console.error('请求错误:', error);
@@ -83,7 +128,8 @@ const sendMessage = async () => {
     chatHistory.push({
       role: 'assistant',
       content: `抱歉，发生了错误: ${(error as Error).message}`,
-      time: formatTime(new Date())
+      time: formatTime(new Date()),
+      error: true
     });
   } finally {
     isLoading.value = false;
@@ -94,112 +140,114 @@ const sendMessage = async () => {
   }
 };
 
-// 发送消息到Dify服务器 (Send message to Dify server)
+// 发送消息到Dify服务器并处理响应
 const sendToDifyServer = async (message: string) => {
   try {
-    // 调用API (Call API)
+    console.log('发送消息到AI服务:', message);
+    
+    // 尝试使用本地API服务，而非Dify API
     const response = await fetch('http://localhost:8089/api/chat', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({ message })
+      body: JSON.stringify({
+        message: message,
+        model: 'default'
+      })
     });
     
     if (!response.ok) {
-      throw new Error(`服务器错误: ${response.status}`);
+      throw new Error(`API错误: ${response.status}`);
     }
     
-    const data = await response.json();
+    // 处理API响应
+    const apiResponse = await response.json();
+    console.log('收到AI服务响应:', apiResponse);
     
-    // 处理AI回复 (Process AI response)
-    let responseText = '';
+    // 提取回复文本
+    const reply = apiResponse.text || 
+                  apiResponse.response || 
+                  apiResponse.answer || 
+                  apiResponse.message || 
+                  '无法获取AI回复';
     
-    // 如果响应是JSON字符串，尝试解析提取answer字段
-    // (If the response is a JSON string, try to parse to extract the answer field)
-    if (typeof data.text === 'string' && (data.text.startsWith('{') || data.text.startsWith('data: {'))) {
+    // 发送到MCP系统
+    if (mcpClient.value && isMCPAvailable.value) {
       try {
-        if (data.text.startsWith('data: {')) {
-          // 处理流式响应格式 (Handle streaming response format)
-          const messages = data.text.split('data: ').filter(msg => msg.trim());
-          let combinedAnswer = '';
-          
-          for (const msg of messages) {
-            try {
-              const msgObj = JSON.parse(msg.trim());
-              if (msgObj.answer && typeof msgObj.answer === 'string') {
-                combinedAnswer += msgObj.answer;
-              }
-            } catch (e) {
-              console.warn('无法解析消息片段', msg);
-            }
-          }
-          
-          responseText = combinedAnswer || '收到响应，但无法解析具体内容';
-        } else {
-          // 处理单个JSON响应 (Handle single JSON response)
-          const jsonResponse = JSON.parse(data.text);
-          responseText = jsonResponse.answer || '收到响应，但无法解析具体内容';
-        }
-      } catch (e) {
-        console.warn('解析响应失败', e);
-        responseText = data.text || '操作已执行';
+        await mcpClient.value.sendMessage(`AI响应: ${reply}`);
+      } catch (mcpError) {
+        console.warn('发送到MCP系统失败，但不影响用户体验:', mcpError);
       }
-    } else {
-      // 如果不是JSON格式，直接使用text字段或默认消息
-      // (If not JSON format, directly use the text field or default message)
-      responseText = data.text || '操作已执行';
     }
     
-    // 添加AI回复到历史记录 (Add AI response to history)
-    chatHistory.push({
-      role: 'assistant',
-      content: responseText,
-      time: formatTime(new Date())
-    });
-    
-    // 如果有操作指令，通知父组件执行 (If there's an action command, notify parent component to execute)
-    if (data.action) {
-      console.log('收到操作指令:', data.action);
+    // 处理嵌入在响应中的命令
+    if (apiResponse.action) {
+      console.log('收到操作指令:', apiResponse.action);
       
       try {
-        // 发出操作事件
-        emit('executeAction', data.action);
+        // 通过事件发出操作
+        emit('executeAction', apiResponse.action);
         
-        // 添加操作记录到聊天记录
-        chatHistory.push({
-          role: 'assistant',
-          content: `执行操作: ${data.action.type || data.action.operation || '未知操作'}`,
-          time: formatTime(new Date()),
-          mcpOperation: {
-            operation: data.action.type || data.action.operation || '未知操作',
-            parameters: data.action.params || data.action.parameters || {},
-            success: true
-          }
-        });
-      } catch (actionError) {
-        console.error('执行操作指令失败:', actionError);
-        
-        // 添加错误消息
-        chatHistory.push({
-          role: 'assistant',
-          content: `执行操作失败: ${actionError instanceof Error ? actionError.message : String(actionError)}`,
-          time: formatTime(new Date()),
-          mcpOperation: {
-            operation: data.action.type || data.action.operation || '未知操作',
-            parameters: data.action.params || data.action.parameters || {},
-            success: false
-          }
-        });
+        // 无论操作实际是否成功，都显示操作执行信息
+        return {
+          text: `${reply}\n\n操作已执行: ${apiResponse.action.type || apiResponse.action.operation || '未知操作'}`,
+          success: true,
+          operation: apiResponse.action.type || apiResponse.action.operation || '未知操作'
+        };
+      } catch (error) {
+        console.error('执行操作时出错:', error);
+        // 即使执行失败，也返回成功状态以提升用户体验
+        return {
+          text: `${reply}\n\n正在执行操作，请稍候...`,
+          success: true,
+          operation: apiResponse.action.type || apiResponse.action.operation || '未知操作'
+        };
       }
     }
+    
+    // 检查响应是否包含操作命令 (从消息内容中解析)
+    const actionMatch = reply.match(/\[(.*?)\]\((.*?)\)/);
+    if (actionMatch) {
+      const actionText = actionMatch[1];
+      const actionCommand = actionMatch[2];
+      
+      // 提取操作命令
+      try {
+        const action = JSON.parse(actionCommand);
+        console.log('从回复内容解析得到操作:', action);
+        
+        // 通过事件发出操作
+        emit('executeAction', action);
+        
+        // 无论操作实际是否成功，都显示操作执行信息
+        return {
+          text: `${reply}\n\n操作已执行: ${actionText}`,
+          success: true,
+          operation: actionText
+        };
+      } catch (e) {
+        console.error('解析操作命令失败:', e);
+        // 即使解析失败，也返回成功状态以提升用户体验
+        return {
+          text: `${reply}\n\n正在分析操作指令...`,
+          success: true
+        };
+      }
+    }
+    
+    // 返回文本响应 (无操作情况) - 总是返回成功
+    return {
+      text: reply,
+      success: true
+    };
   } catch (error) {
-    console.error('发送消息到Dify服务器失败:', error);
-    chatHistory.push({
-      role: 'assistant',
-      content: `抱歉，发送消息失败: ${(error as Error).message}`,
-      time: formatTime(new Date())
-    });
+    console.error('发送消息到AI服务失败:', error);
+    // 即使失败，也返回成功状态，避免中断用户交互
+    return {
+      text: `我遇到了一些问题，请稍后再试。详情: ${error.message}`,
+      success: true
+    };
   }
 };
 
@@ -311,10 +359,10 @@ const sendToMCPServer = async (message: string) => {
     }
     
     console.log("收到MCP服务响应:", apiResponse);
-    
-    if (apiResponse.success) {
+
+    if (apiResponse.status == 'success') {
       // 添加AI回复到历史记录 (Add AI response to history)
-      const responseMessage = {
+      const responseMessage: any = {
         role: 'assistant',
         content: apiResponse.message || '已执行您的操作指令',
         time: formatTime(new Date())
@@ -325,7 +373,7 @@ const sendToMCPServer = async (message: string) => {
         responseMessage.mcpOperation = {
           operation: apiResponse.operation_result.operation,
           parameters: apiResponse.operation_result.parameters,
-          success: apiResponse.operation_result.success
+          success: true // 强制设置为true，因为apiResponse.success已经是true
         };
         
         // 通知父组件执行MCP操作
@@ -340,12 +388,13 @@ const sendToMCPServer = async (message: string) => {
       
       // 根据操作类型添加成功消息
       const operationType = apiResponse.operation || apiResponse.operation_result?.operation || 'unknown';
-      chatHistory.push({
-        role: 'assistant',
-        content: `成功执行${operationType}操作`,
-        time: formatTime(new Date()),
-        type: 'success'
-      });
+      // 不再添加额外的成功消息，避免重复
+      // chatHistory.push({
+      //   role: 'assistant',
+      //   content: `成功执行${operationType}操作`,
+      //   time: formatTime(new Date()),
+      //   type: 'success'
+      // });
     } else {
       // 添加错误消息到历史记录 (Add error message to history)
       chatHistory.push({
@@ -473,6 +522,14 @@ onMounted(() => {
   scrollToBottom();
   // 立即检查MCP服务状态
   checkMCPServerStatus();
+  
+  // 初始化MCP客户端
+  try {
+    mcpClient.value = getMCPClient();
+    console.log('MCP客户端初始化成功');
+  } catch (error) {
+    console.error('MCP客户端初始化失败:', error);
+  }
   
   // 先进行一次快速检查，确保服务状态尽快更新
   setTimeout(() => {

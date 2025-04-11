@@ -2,7 +2,6 @@
 import { ref, onMounted, onBeforeUnmount } from 'vue';
 import ModelViewer from './components/ModelViewer.vue';
 import ChatDialog from './components/ChatDialog.vue';
-import { mcpCommandBuilder } from './components/MCPCommandBuilder';
 
 // 引用模型查看器组件 (Reference to model viewer component)
 const modelViewerRef = ref<InstanceType<typeof ModelViewer> | null>(null);
@@ -192,7 +191,9 @@ const handleChatAction = (action) => {
     else {
       console.error('找不到可用的旋转方法');
     }
-  } else if (action.type === 'zoom' || action.operation === 'zoom') {
+  }
+  // 处理缩放操作
+  else if (action.type === 'zoom' || action.operation === 'zoom') {
     const params = action.parameters || action.params || {};
     const scale = params.scale || 1.5;
     
@@ -206,36 +207,39 @@ const handleChatAction = (action) => {
     else if (modelViewerRef.value && typeof modelViewerRef.value.zoomModel === 'function') {
       modelViewerRef.value.zoomModel({scale});
     }
-    // 再检查app全局对象中的方法
+    // 再检查全局对象中的其他可能方法
+    else if (window.scaleModel && typeof window.scaleModel === 'function') {
+      window.scaleModel(scale);
+    }
     else if (window.app && typeof window.app.zoomComponent === 'function') {
       window.app.zoomComponent(null, scale);
     }
     else {
       console.error('找不到可用的缩放方法');
     }
-  } else if (action.type === 'focus' || action.operation === 'focus') {
+  }
+  // 处理聚焦操作
+  else if (action.type === 'focus' || action.operation === 'focus') {
     const params = action.parameters || action.params || {};
     const target = params.target || 'center';
     
     console.log(`执行聚焦操作: 目标=${target}`);
     
-    // 优先使用全局window.focusOnModel函数
-    if (typeof window.focusOnModel === 'function') {
-      window.focusOnModel({target});
+    // 优先使用全局window.focusModel函数
+    if (typeof window.focusModel === 'function') {
+      window.focusModel({target});
     }
     // 其次检查modelViewerRef中的方法
-    else if (modelViewerRef.value && typeof modelViewerRef.value.focusOnModel === 'function') {
-      modelViewerRef.value.focusOnModel({target});
-    }
-    // 再检查app全局对象中的方法
-    else if (window.app && typeof window.app.focusOnComponent === 'function') {
-      window.app.focusOnComponent(target);
+    else if (modelViewerRef.value && typeof modelViewerRef.value.focusModel === 'function') {
+      modelViewerRef.value.focusModel({target});
     }
     else {
       console.error('找不到可用的聚焦方法');
     }
-  } else if (action.type === 'reset' || action.operation === 'reset') {
-    console.log('执行重置操作');
+  }
+  // 处理重置操作
+  else if (action.type === 'reset' || action.operation === 'reset') {
+    console.log('执行重置视图操作');
     
     // 优先使用全局window.resetModel函数
     if (typeof window.resetModel === 'function') {
@@ -245,14 +249,11 @@ const handleChatAction = (action) => {
     else if (modelViewerRef.value && typeof modelViewerRef.value.resetModel === 'function') {
       modelViewerRef.value.resetModel();
     }
-    // 再检查app全局对象中的方法
-    else if (window.app && typeof window.app.resetModel === 'function') {
-      window.app.resetModel();
-    }
     else {
       console.error('找不到可用的重置方法');
     }
-  } else {
+  }
+  else {
     console.warn(`未知操作类型: ${action.type || action.operation}`);
   }
 };
@@ -268,7 +269,7 @@ onMounted(async () => {
   // setInterval(checkStatus, 30000);
 });
 
-// 修改组件卸载前的清理
+// 组件卸载前执行
 onBeforeUnmount(() => {
   // 断开WebSocket连接
   wsManager.disconnect();
@@ -277,6 +278,19 @@ onBeforeUnmount(() => {
   if (statusCheckInterval) {
     clearInterval(statusCheckInterval);
   }
+  
+  // 关闭WebSocket连接
+  if (wsConnection.value) {
+    wsConnection.value.close();
+    wsConnection.value = null;
+  }
+  
+  // 移除测试按钮的事件处理
+  document.querySelector('#rotate-left-btn')?.removeEventListener('click', () => {});
+  document.querySelector('#rotate-right-btn')?.removeEventListener('click', () => {});
+  document.querySelector('#zoom-in-btn')?.removeEventListener('click', () => {});
+  document.querySelector('#zoom-out-btn')?.removeEventListener('click', () => {});
+  document.querySelector('#reset-btn')?.removeEventListener('click', () => {});
 });
 
 // 移除或注释掉checkStatus函数
@@ -431,10 +445,16 @@ const rotateThroughMCP = (direction, angle) => {
     console.log('旋转结果:', result);
     return result.success;
   }
-  // 最后，通过WebSocket发送MCP命令
+  // 使用 WebSocket 发送简单的命令
   else {
-    console.log('使用WebSocket发送MCP命令');
-    const command = mcpCommandBuilder.rotate(direction, angle);
+    console.log('使用WebSocket发送旋转命令');
+    const command = {
+      action: 'rotate',
+      parameters: {
+        direction: direction,
+        angle: angle
+      }
+    };
     
     // 添加类型和时间戳，转换为合适的消息格式
     const message = {
@@ -451,8 +471,13 @@ const rotateThroughMCP = (direction, angle) => {
 const zoomThroughMCP = (scale) => {
   console.log(`通过MCP协议缩放模型: 比例=${scale}`);
   
-  // 使用MCPCommandBuilder构建缩放命令
-  const command = mcpCommandBuilder.zoom(scale);
+  // 创建缩放命令
+  const command = {
+    action: 'zoom',
+    parameters: {
+      scale: scale
+    }
+  };
   
   // 添加类型和时间戳，转换为合适的消息格式
   const message = {
@@ -468,8 +493,10 @@ const zoomThroughMCP = (scale) => {
 const resetThroughMCP = () => {
   console.log('通过MCP协议重置模型视图');
   
-  // 使用MCPCommandBuilder构建重置命令
-  const command = mcpCommandBuilder.reset();
+  // 创建重置命令
+  const command = {
+    action: 'reset'
+  };
   
   // 添加类型和时间戳，转换为合适的消息格式
   const message = {
@@ -492,22 +519,6 @@ onMounted(() => {
   document.querySelector('#zoom-in-btn')?.addEventListener('click', () => zoomThroughMCP(1.2));
   document.querySelector('#zoom-out-btn')?.addEventListener('click', () => zoomThroughMCP(0.8));
   document.querySelector('#reset-btn')?.addEventListener('click', () => resetThroughMCP());
-});
-
-// 组件卸载前执行
-onBeforeUnmount(() => {
-  // 关闭WebSocket连接
-  if (wsConnection.value) {
-    wsConnection.value.close();
-    wsConnection.value = null;
-  }
-  
-  // 移除测试按钮的事件处理
-  document.querySelector('#rotate-left-btn')?.removeEventListener('click', () => {});
-  document.querySelector('#rotate-right-btn')?.removeEventListener('click', () => {});
-  document.querySelector('#zoom-in-btn')?.removeEventListener('click', () => {});
-  document.querySelector('#zoom-out-btn')?.removeEventListener('click', () => {});
-  document.querySelector('#reset-btn')?.removeEventListener('click', () => {});
 });
 </script>
 
