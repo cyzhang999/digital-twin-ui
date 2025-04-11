@@ -2,6 +2,7 @@
 import { ref, onMounted, onBeforeUnmount } from 'vue';
 import ModelViewer from './components/ModelViewer.vue';
 import ChatDialog from './components/ChatDialog.vue';
+import { mcpCommandBuilder } from './components/MCPCommandBuilder';
 
 // 引用模型查看器组件 (Reference to model viewer component)
 const modelViewerRef = ref<InstanceType<typeof ModelViewer> | null>(null);
@@ -292,6 +293,222 @@ const checkStatus = async () => {
   }
 };
 */
+
+// 添加WebSocket连接状态
+const wsStatus = ref('disconnected');
+const serverStatus = ref({});
+const wsConnection = ref(null);
+
+// 初始化WebSocket连接
+const initWebSocket = () => {
+  try {
+    // 获取WebSocket URL，优先使用环境变量，否则使用默认值
+    const wsUrl = import.meta.env.VITE_PYTHON_WS_URL || 'ws://localhost:9000';
+    const fullUrl = `${wsUrl}/ws/mcp`;
+    
+    // 关闭已有连接
+    if (wsConnection.value && wsConnection.value.readyState !== WebSocket.CLOSED) {
+      wsConnection.value.close();
+    }
+    
+    console.log(`正在连接到WebSocket: ${fullUrl}`);
+    wsStatus.value = 'connecting';
+    
+    // 创建新的WebSocket连接
+    wsConnection.value = new WebSocket(fullUrl);
+    
+    // 连接打开时的处理
+    wsConnection.value.onopen = () => {
+      console.log('WebSocket连接已建立');
+      wsStatus.value = 'connected';
+      
+      // 发送初始化消息
+      sendCommand({
+        type: 'init',
+        clientType: 'web_ui',
+        clientVersion: '1.0.0'
+      });
+      
+      // 请求服务器状态
+      requestServerStatus();
+    };
+    
+    // 接收消息时的处理
+    wsConnection.value.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        console.log('收到WebSocket消息:', data);
+        
+        // 处理不同类型的消息
+        if (data.type === 'status') {
+          serverStatus.value = data.data || {};
+        } else if (data.type === 'mcp.response') {
+          handleMCPResponse(data);
+        }
+      } catch (error) {
+        console.error('处理WebSocket消息时出错:', error);
+      }
+    };
+    
+    // 连接关闭时的处理
+    wsConnection.value.onclose = (event) => {
+      console.log(`WebSocket连接已关闭: code=${event.code}, reason=${event.reason}`);
+      wsStatus.value = 'disconnected';
+      
+      // 5秒后自动重连
+      setTimeout(() => {
+        if (wsStatus.value === 'disconnected') {
+          console.log('尝试重新连接WebSocket...');
+          initWebSocket();
+        }
+      }, 5000);
+    };
+    
+    // 连接错误时的处理
+    wsConnection.value.onerror = (error) => {
+      console.error('WebSocket连接错误:', error);
+      wsStatus.value = 'error';
+    };
+  } catch (error) {
+    console.error('初始化WebSocket时出错:', error);
+    wsStatus.value = 'error';
+  }
+};
+
+// 发送WebSocket消息
+const sendCommand = (command) => {
+  if (wsConnection.value && wsConnection.value.readyState === WebSocket.OPEN) {
+    try {
+      const commandStr = JSON.stringify(command);
+      wsConnection.value.send(commandStr);
+      console.log('已发送命令:', command);
+      return true;
+    } catch (error) {
+      console.error('发送命令时出错:', error);
+      return false;
+    }
+  } else {
+    console.warn('WebSocket未连接，无法发送命令');
+    return false;
+  }
+};
+
+// 请求服务器状态
+const requestServerStatus = () => {
+  sendCommand({
+    type: 'status.request',
+    timestamp: new Date().toISOString()
+  });
+};
+
+// 处理MCP响应
+const handleMCPResponse = (response) => {
+  console.log('处理MCP响应:', response);
+  
+  // 可以根据commandId、status等处理具体的响应
+  if (response.status === 'success') {
+    console.log('MCP命令执行成功:', response.data);
+  } else if (response.status === 'error') {
+    console.error('MCP命令执行失败:', response.message);
+  }
+};
+
+// 使用MCP协议旋转模型
+const rotateThroughMCP = (direction, angle) => {
+  console.log(`通过MCP协议旋转模型: 方向=${direction}, 角度=${angle}`);
+  
+  // 优先使用全局window.rotateModel函数
+  if (typeof window.rotateModel === 'function') {
+    console.log('使用全局rotateModel函数');
+    const result = window.rotateModel({direction, angle});
+    console.log('旋转结果:', result);
+    return result.success;
+  }
+  // 其次，通过模型组件调用
+  else if (modelViewerRef.value && typeof modelViewerRef.value.rotateModel === 'function') {
+    console.log('使用组件rotateModel方法');
+    const result = modelViewerRef.value.rotateModel({direction, angle});
+    console.log('旋转结果:', result);
+    return result.success;
+  }
+  // 最后，通过WebSocket发送MCP命令
+  else {
+    console.log('使用WebSocket发送MCP命令');
+    const command = mcpCommandBuilder.rotate(direction, angle);
+    
+    // 添加类型和时间戳，转换为合适的消息格式
+    const message = {
+      type: 'mcp.command',
+      command: command,
+      timestamp: new Date().toISOString()
+    };
+    
+    return sendCommand(message);
+  }
+};
+
+// 使用MCP协议缩放模型
+const zoomThroughMCP = (scale) => {
+  console.log(`通过MCP协议缩放模型: 比例=${scale}`);
+  
+  // 使用MCPCommandBuilder构建缩放命令
+  const command = mcpCommandBuilder.zoom(scale);
+  
+  // 添加类型和时间戳，转换为合适的消息格式
+  const message = {
+    type: 'mcp.command',
+    command: command,
+    timestamp: new Date().toISOString()
+  };
+  
+  return sendCommand(message);
+};
+
+// 重置模型视图
+const resetThroughMCP = () => {
+  console.log('通过MCP协议重置模型视图');
+  
+  // 使用MCPCommandBuilder构建重置命令
+  const command = mcpCommandBuilder.reset();
+  
+  // 添加类型和时间戳，转换为合适的消息格式
+  const message = {
+    type: 'mcp.command',
+    command: command,
+    timestamp: new Date().toISOString()
+  };
+  
+  return sendCommand(message);
+};
+
+// 组件挂载时执行
+onMounted(() => {
+  // 初始化WebSocket连接
+  initWebSocket();
+  
+  // 添加测试按钮的事件处理
+  document.querySelector('#rotate-left-btn')?.addEventListener('click', () => rotateThroughMCP('left', 15));
+  document.querySelector('#rotate-right-btn')?.addEventListener('click', () => rotateThroughMCP('right', 15));
+  document.querySelector('#zoom-in-btn')?.addEventListener('click', () => zoomThroughMCP(1.2));
+  document.querySelector('#zoom-out-btn')?.addEventListener('click', () => zoomThroughMCP(0.8));
+  document.querySelector('#reset-btn')?.addEventListener('click', () => resetThroughMCP());
+});
+
+// 组件卸载前执行
+onBeforeUnmount(() => {
+  // 关闭WebSocket连接
+  if (wsConnection.value) {
+    wsConnection.value.close();
+    wsConnection.value = null;
+  }
+  
+  // 移除测试按钮的事件处理
+  document.querySelector('#rotate-left-btn')?.removeEventListener('click', () => {});
+  document.querySelector('#rotate-right-btn')?.removeEventListener('click', () => {});
+  document.querySelector('#zoom-in-btn')?.removeEventListener('click', () => {});
+  document.querySelector('#zoom-out-btn')?.removeEventListener('click', () => {});
+  document.querySelector('#reset-btn')?.removeEventListener('click', () => {});
+});
 </script>
 
 <template>

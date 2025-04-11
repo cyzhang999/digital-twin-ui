@@ -337,12 +337,22 @@ const sendToMCPServer = async (message: string) => {
       }
       
       chatHistory.push(responseMessage);
+      
+      // 根据操作类型添加成功消息
+      const operationType = apiResponse.operation || apiResponse.operation_result?.operation || 'unknown';
+      chatHistory.push({
+        role: 'assistant',
+        content: `成功执行${operationType}操作`,
+        time: formatTime(new Date()),
+        type: 'success'
+      });
     } else {
       // 添加错误消息到历史记录 (Add error message to history)
       chatHistory.push({
         role: 'assistant',
-        content: `抱歉，无法执行指令: ${apiResponse.error || apiResponse.message || '未知错误'}`,
-        time: formatTime(new Date())
+        content: `操作执行失败: ${apiResponse.error || apiResponse.message || '未知错误'}`,
+        time: formatTime(new Date()),
+        type: 'error'
       });
     }
   } catch (error) {
