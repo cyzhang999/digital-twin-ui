@@ -35,7 +35,7 @@ declare global {
     // 模型操作方法
     rotateModel: (params: { direction: string, angle: number, target?: string }) => boolean;
     zoomModel: (params: { scale: number, target?: string }) => boolean;
-    focusOnModel: (params: { target?: string }) => boolean;
+    focusModel: (params: { target?: string }) => boolean;
     resetModel: (params?: any) => boolean;
 
     // 应用对象
@@ -508,10 +508,57 @@ const zoomPart = (part: THREE.Object3D, scaleFactor: number) => {
   }
 };
 
-// 添加resetModel函数
+// 添加resetModel函数,使用MCP命令
+const resetModel = async () => {
+  try {
+    console.log('执行重置命令');
+    
+    // 检查THREE.js对象是否已初始化
+    if (!scene || !camera || !renderer || !controls) {
+      console.error('THREE.js对象未完全初始化');
+      return false;
+    }
+
+    // 检查WebSocket连接是否活跃
+    if (!wsManager.isConnectionActive('/ws/command')) {
+      console.error('命令WebSocket连接未就绪，尝试重新连接');
+      try {
+        await wsManager.connect('/ws/command');
+        console.log('已重新连接到命令WebSocket');
+      } catch (connError) {
+        console.error('重新连接命令WebSocket失败:', connError);
+        // 失败后使用本地实现
+        return executeResetModel();
+      }
+    }
+
+    // 创建并发送重置命令
+    const command = {
+      type: 'mcp.command',
+      action: 'reset',
+      parameters: {},
+      id: `cmd_${Date.now()}_${Math.floor(Math.random() * 10000)}`,
+      timestamp: new Date().toISOString()
+    };
+    
+    console.log('发送MCP重置命令:', command);
+    
+    const result = await wsManager.sendCommand('/ws/command', command);
+    console.log('重置命令执行结果:', result);
+
+    return result?.success || result?.status === 'success' || true;
+  } catch (error) {
+    console.error('重置命令执行失败:', error);
+    // 出错时尝试使用本地实现
+    return executeResetModel();
+  }
+};
+
+// 清晰定义executeResetModel实现
 const executeResetModel = () => {
   try {
-    console.log('执行模型重置操作');
+    console.log('执行本地重置操作');
+    
     if (!scene || !camera || !controls || !renderer) {
       console.error('THREE.js对象未完全初始化，无法执行重置操作');
       return false;
@@ -535,18 +582,12 @@ const executeResetModel = () => {
     // 重新渲染场景
     renderer.render(scene, camera);
     
-    console.log('模型重置完成');
+    console.log('重置模型完成');
     return true;
   } catch (error) {
     console.error('重置模型时出错:', error);
     return false;
   }
-};
-
-// 确保全局resetModel函数调用本地实现
-const resetModelWrapper = () => {
-  console.log('resetModel被调用');
-  return executeResetModel();
 };
 
 // 添加材质管理
@@ -936,8 +977,8 @@ const setupWebSocketCommandListener = () => {
         } else if (operation === 'zoom') {
           window.zoomModel(params);
         } else if (operation === 'focus') {
-          // 其他操作...
-          console.log('接收到focus命令，暂未实现');
+          // 执行聚焦操作
+          window.focusModel(params);
         } else if (operation === 'reset') {
           // 重置操作...
           if (typeof window.resetModel === 'function') {
@@ -1102,12 +1143,24 @@ onMounted(async () => {
 
   window.focusModel = (params) => {
     console.log('全局focusModel被调用:', params);
-    if (typeof focusOnModel === 'function') {
-      return focusOnModel(params);
-    } else {
-      console.error('focusOnModel方法未定义');
-      return false;
+    if (typeof executeLocalFocus === 'function') {
+      // 确保是对象格式
+      let focusParams = params;
+      if (typeof params === 'string') {
+        // 兼容字符串参数
+        focusParams = { target: params };
+      } else if (!params || typeof params !== 'object') {
+        // 默认参数
+        focusParams = { target: 'center' };
+      }
+      
+      // 确保target有值
+      if (!focusParams.target) focusParams.target = 'center';
+      
+      return executeLocalFocus(focusParams);
     }
+    console.error('executeLocalFocus方法未定义');
+    return false;
   };
 
   window.resetModel = () => {
@@ -1121,8 +1174,8 @@ onMounted(async () => {
   }
   window.app.rotateModel = rotateModel;
   window.app.zoomModel = zoomModel;
-  window.app.focusModel = focusOnModel;
-  window.app.resetModel = resetModelWrapper;
+  window.app.focusModel = window.focusModel;
+  window.app.resetModel = window.resetModel;
 
   console.log('已将模型操作方法挂载到window和window.app对象');
 });
@@ -1387,46 +1440,111 @@ const focusOnModel = async (params) => {
       } catch (connError) {
         console.error('重新连接命令WebSocket失败:', connError);
         // 失败后使用本地聚焦实现
-        console.log('使用本地聚焦实现');
-        if (controls) {
-          controls.focus(params.target);
-          return true;
-        }
-        return false;
+        return executeLocalFocus(params);
       }
     }
 
     // 创建并发送聚焦命令
-    const command = wsManager.createCommand()
-      .focus(params.target);
-    
-    // 包装为标准MCP消息
-    const mcpMessage = {
+    const command = {
       type: 'mcp.command',
-      command: command,
+      action: 'focus',
+      parameters: {
+        target: params.target || 'center'
+      },
+      id: `cmd_${Date.now()}_${Math.floor(Math.random() * 10000)}`,
       timestamp: new Date().toISOString()
     };
     
-    console.log('发送MCP聚焦命令:', mcpMessage);
+    console.log('发送MCP聚焦命令:', command);
     
-    const result = await wsManager.sendCommand('/ws/command', mcpMessage);
+    const result = await wsManager.sendCommand('/ws/command', command);
     console.log('聚焦命令执行结果:', result);
 
-    return result?.success || true; // 如果没有明确失败，则认为成功
+    return result?.success || result?.status === 'success' || true;
   } catch (error) {
     console.error('聚焦命令执行失败:', error);
     
     // 出错时尝试使用本地实现
-    try {
-      console.log('使用本地聚焦实现');
-      if (controls) {
-        controls.focus(params.target);
-        return true;
-      }
-    } catch (fallbackError) {
-      console.error('本地聚焦实现也失败:', fallbackError);
+    return executeLocalFocus(params);
+  }
+};
+
+// 添加聚焦功能的实现
+const executeLocalFocus = (params) => {
+  try {
+    console.log('执行本地聚焦操作:', params);
+    
+    if (!scene || !camera || !controls || !renderer) {
+      console.error('THREE.js对象未完全初始化，无法执行聚焦操作');
+      return false;
     }
     
+    // 获取目标区域
+    const target = params.target || 'center';
+    
+    // 定义预设聚焦位置
+    const focusPositions = {
+      'center': { position: new THREE.Vector3(0, 5, 10), target: new THREE.Vector3(0, 0, 0) },
+      'model': { position: new THREE.Vector3(0, 5, 10), target: new THREE.Vector3(0, 0, 0) },
+      'meeting': { position: new THREE.Vector3(5, 3, 0), target: new THREE.Vector3(5, 1, 0) },
+      'office': { position: new THREE.Vector3(-5, 3, 0), target: new THREE.Vector3(-5, 1, 0) },
+      'area域': { position: new THREE.Vector3(0, 6, 10), target: new THREE.Vector3(0, 0, 0) }
+    };
+    
+    // 如果找不到预设位置，使用默认值
+    const focusPosition = focusPositions[target] || focusPositions['center'];
+    
+    // 开始位置动画
+    const startPosition = camera.position.clone();
+    const startTarget = controls.target.clone();
+    const endPosition = focusPosition.position.clone();
+    const endTarget = focusPosition.target.clone();
+    
+    // 取消之前的动画（如果有）
+    if (window.__focusAnimationId) {
+      cancelAnimationFrame(window.__focusAnimationId);
+    }
+    
+    // 设置动画持续时间（毫秒）
+    const duration = 1000; 
+    const startTime = Date.now();
+    
+    // 动画函数
+    const animateFocus = () => {
+      const elapsedTime = Date.now() - startTime;
+      const progress = Math.min(elapsedTime / duration, 1);
+      
+      // 使用缓动函数使动画更平滑
+      const easeProgress = progress * (2 - progress); // 简单二次缓动
+      
+      // 计算当前位置
+      camera.position.lerpVectors(startPosition, endPosition, easeProgress);
+      controls.target.lerpVectors(startTarget, endTarget, easeProgress);
+      
+      // 确保相机正确朝向目标
+      camera.lookAt(controls.target);
+      camera.updateProjectionMatrix();
+      controls.update();
+      
+      // 渲染场景
+      renderer.render(scene, camera);
+      
+      // 如果动画未完成，继续下一帧
+      if (progress < 1) {
+        window.__focusAnimationId = requestAnimationFrame(animateFocus);
+      } else {
+        // 动画完成
+        window.__focusAnimationId = undefined;
+      }
+    };
+    
+    // 开始动画
+    window.__focusAnimationId = requestAnimationFrame(animateFocus);
+    
+    console.log(`聚焦到${target}区域完成`);
+    return true;
+  } catch (error) {
+    console.error('聚焦操作执行失败:', error);
     return false;
   }
 };
@@ -1438,12 +1556,6 @@ window.changeMaterial = (target: string, materialType: string, color: string, op
 
 window.toggleAnimation = (name: string, enabled: boolean) => {
   return toggleAnimation(name, enabled);
-};
-
-// 添加全局的resetModel函数
-window.resetModel = () => {
-  console.log('全局resetModel被调用');
-  return executeResetModel();
 };
 
 // 将组件方法绑定到全局app对象

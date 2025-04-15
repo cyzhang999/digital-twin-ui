@@ -24,11 +24,12 @@ const chatContainerRef = ref<HTMLElement | null>(null);
 const isLoading = ref(false);
 
 // AI模型选择 (AI model selection)
-const selectedModel = ref('dify'); // 默认使用Dify
-const models = [
-  { value: 'dify', label: '对话模式' },
-  { value: 'mcp', label: '模型操作模式' }
-];
+// 移除模式选择，改为统一处理
+// const selectedModel = ref('dify'); // 默认使用Dify
+// const models = [
+//   { value: 'dify', label: '对话模式' },
+//   { value: 'mcp', label: '模型操作模式' }
+// ];
 
 // MCP服务器状态 (MCP server status)
 const mcpServerStatus = ref('unknown');
@@ -43,10 +44,10 @@ const isMCPAvailable = computed(() => {
   return mcpServerStatus.value !== 'offline';
 });
 
-// 计算是否使用MCP模式 (Compute if using MCP mode)
-const isMCPMode = computed(() => {
-  return selectedModel.value === 'mcp';
-});
+// 计算是否使用MCP模式 - 移除这个，因为现在统一处理
+// const isMCPMode = computed(() => {
+//   return selectedModel.value === 'mcp';
+// });
 
 // 关闭对话框 (Close dialog)
 const closeDialog = () => {
@@ -82,45 +83,55 @@ const sendMessage = async () => {
   scrollToBottom();
   
   try {
-    // 发送消息到Dify服务，获取响应
-    const response = await sendToDifyServer(message);
+    // 创建一个操作ID，用于标识当前操作
+    const operationId = `op_${Date.now()}`;
     
-    if (!response || !response.success) {
-      // 处理失败情况
+    // 先快速检测是否包含操作指令 (预检测)
+    const detectedOperation = detectOperation(message);
+    
+    // 如果预检测到操作类型，记录到会话存储中
+    if (detectedOperation) {
+      // 将操作类型保存到会话存储中
+      sessionStorage.setItem(`last_mcp_operation_type`, detectedOperation.operation);
+      sessionStorage.setItem(`last_mcp_operation_time`, Date.now().toString());
+    }
+    
+    // 发送消息到AI服务（Dify/SpringBoot），此服务应该能够分析是否包含操作指令
+    const aiResponse = await sendToDifyServer(message);
+    
+    // 处理AI响应
+    if (aiResponse && aiResponse.success) {
+      // 添加AI回复到历史记录
       chatHistory.push({
         role: 'assistant',
-        content: response?.text || '处理消息时发生错误',
+        content: aiResponse.text,
         time: formatTime(new Date()),
-        error: true
-      });
-    } else {
-      // 处理成功情况
-      chatHistory.push({
-        role: 'assistant',
-        content: response.text,
-        time: formatTime(new Date()),
-        mcpOperation: response.operation ? {
-          operation: response.operation,
-          parameters: {},
+        mcpOperation: aiResponse.operation ? {
+          operation: aiResponse.operation,
+          parameters: aiResponse.parameters || {},
           success: true
         } : undefined
       });
-    }
-    
-    // 如果是MCP模式，再发送到MCP服务处理模型操作
-    if (isMCPMode.value && isMCPAvailable.value && response?.success) {
-      try {
-        await sendToMCPServer(message);
-      } catch (mcpError) {
-        console.error('MCP服务处理失败:', mcpError);
-        // 添加警告信息但不中断流程
-        chatHistory.push({
-          role: 'assistant',
-          content: `模型操作服务提示: ${mcpError.message || '操作处理失败'}`,
-          time: formatTime(new Date()),
-          type: 'warning'
-        });
+      
+      // 如果AI服务检测到操作指令并返回了action或operation
+      if (aiResponse.action || aiResponse.operation) {
+        // 优先使用返回的action对象
+        const actionObj = aiResponse.action || { 
+          type: aiResponse.operation,
+          params: aiResponse.parameters || {}
+        };
+        
+        // 发出操作事件
+        emit('executeAction', actionObj);
       }
+    } else {
+      // 处理失败情况
+      chatHistory.push({
+        role: 'assistant',
+        content: aiResponse?.text || '处理消息时发生错误',
+        time: formatTime(new Date()),
+        error: true
+      });
     }
   } catch (error) {
     console.error('请求错误:', error);
@@ -140,10 +151,57 @@ const sendMessage = async () => {
   }
 };
 
+// 快速检测操作类型
+const detectOperation = (message: string) => {
+  // 简单的命令识别逻辑
+  let operation = null, parameters = {};
+
+  if (message.includes('旋转')) {
+    operation = 'rotate';
+    parameters = {
+      direction: message.includes('右') ? 'right' : 'left',
+      angle: message.match(/(\d+)\s*度/) ? parseInt(message.match(/(\d+)\s*度/)[1]) : 45
+    };
+  } else if (message.includes('缩放') || message.includes('放大') || message.includes('缩小')) {
+    operation = 'zoom';
+    
+    // 提取比例
+    const scaleMatch = message.match(/(\d+(\.\d+)?)\s*倍/);
+    let scale = scaleMatch ? parseFloat(scaleMatch[1]) : 1.5;
+    
+    if (message.includes('缩小') && scale > 1) {
+      scale = 1 / scale;
+    }
+    
+    parameters = { scale };
+  } else if (message.includes('聚焦') || message.includes('关注')) {
+    operation = 'focus';
+    parameters = { 
+      target: message.includes('中心') ? 'center' : 
+              message.includes('会议') ? 'meeting' : 
+              message.includes('办公') ? 'office' : 'model'
+    };
+  } else if (message.includes('重置') || message.includes('复位')) {
+    operation = 'reset';
+  }
+  
+  return operation ? { operation, parameters } : null;
+};
+
 // 发送消息到Dify服务器并处理响应
 const sendToDifyServer = async (message: string) => {
   try {
     console.log('发送消息到AI服务:', message);
+    
+    // 检测是否包含操作指令 (用于备用)
+    const detectedOperation = detectOperation(message);
+    
+    // 记录操作类型到会话存储，防止重复执行
+    if (detectedOperation) {
+      sessionStorage.setItem('last_mcp_operation_type', detectedOperation.operation);
+      sessionStorage.setItem('last_mcp_operation_time', Date.now().toString());
+      console.log(`已记录操作类型: ${detectedOperation.operation}，防止重复执行`);
+    }
     
     // 尝试使用本地API服务，而非Dify API
     const response = await fetch('http://localhost:8089/api/chat', {
@@ -153,7 +211,8 @@ const sendToDifyServer = async (message: string) => {
       },
       body: JSON.stringify({
         message: message,
-        model: 'default'
+        model: 'default',
+        detect_operation: true  // 添加标志，告诉后端需要检测操作指令
       })
     });
     
@@ -172,246 +231,144 @@ const sendToDifyServer = async (message: string) => {
                   apiResponse.message || 
                   '无法获取AI回复';
     
-    // 发送到MCP系统
-    if (mcpClient.value && isMCPAvailable.value) {
-      try {
-        await mcpClient.value.sendMessage(`AI响应: ${reply}`);
-      } catch (mcpError) {
-        console.warn('发送到MCP系统失败，但不影响用户体验:', mcpError);
-      }
-    }
-    
-    // 处理嵌入在响应中的命令
+    // 如果后端返回了操作指令
     if (apiResponse.action) {
-      console.log('收到操作指令:', apiResponse.action);
+      console.log('收到AI服务的操作指令:', apiResponse.action);
       
-      try {
-        // 通过事件发出操作
-        emit('executeAction', apiResponse.action);
-        
-        // 无论操作实际是否成功，都显示操作执行信息
-        return {
-          text: `${reply}\n\n操作已执行: ${apiResponse.action.type || apiResponse.action.operation || '未知操作'}`,
-          success: true,
-          operation: apiResponse.action.type || apiResponse.action.operation || '未知操作'
-        };
-      } catch (error) {
-        console.error('执行操作时出错:', error);
-        // 即使执行失败，也返回成功状态以提升用户体验
-        return {
-          text: `${reply}\n\n正在执行操作，请稍候...`,
-          success: true,
-          operation: apiResponse.action.type || apiResponse.action.operation || '未知操作'
-        };
+      // 记录操作类型到会话存储，防止重复执行
+      const actionType = apiResponse.action.type || apiResponse.action.operation;
+      if (actionType) {
+        sessionStorage.setItem('last_mcp_operation_type', actionType);
+        sessionStorage.setItem('last_mcp_operation_time', Date.now().toString());
+        console.log(`已记录操作类型: ${actionType}，防止重复执行`);
       }
+      
+      // 返回格式化的响应
+      return {
+        text: reply,
+        success: true,
+        operation: actionType,
+        parameters: apiResponse.action.params || apiResponse.action.parameters,
+        action: apiResponse.action
+      };
     }
     
-    // 检查响应是否包含操作命令 (从消息内容中解析)
+    // 检查是否从回复内容中解析操作命令
     const actionMatch = reply.match(/\[(.*?)\]\((.*?)\)/);
     if (actionMatch) {
-      const actionText = actionMatch[1];
-      const actionCommand = actionMatch[2];
-      
-      // 提取操作命令
       try {
+        const actionText = actionMatch[1];
+        const actionCommand = actionMatch[2];
         const action = JSON.parse(actionCommand);
+        
         console.log('从回复内容解析得到操作:', action);
         
-        // 通过事件发出操作
-        emit('executeAction', action);
+        // 记录操作类型到会话存储，防止重复执行
+        const actionType = action.type || action.operation;
+        if (actionType) {
+          sessionStorage.setItem('last_mcp_operation_type', actionType);
+          sessionStorage.setItem('last_mcp_operation_time', Date.now().toString());
+          console.log(`已记录操作类型: ${actionType}，防止重复执行`);
+        }
         
-        // 无论操作实际是否成功，都显示操作执行信息
         return {
-          text: `${reply}\n\n操作已执行: ${actionText}`,
+          text: reply,
           success: true,
-          operation: actionText
+          operation: actionType,
+          parameters: action.params || action.parameters,
+          action: action
         };
       } catch (e) {
         console.error('解析操作命令失败:', e);
-        // 即使解析失败，也返回成功状态以提升用户体验
-        return {
-          text: `${reply}\n\n正在分析操作指令...`,
-          success: true
-        };
       }
     }
     
-    // 返回文本响应 (无操作情况) - 总是返回成功
+    // 如果后端未检测到操作指令，但我们本地检测到了
+    if (detectedOperation && isMCPAvailable.value) {
+      const opType = detectedOperation.operation;
+      const opParams = detectedOperation.parameters;
+      
+      // 如果是有效的操作类型
+      if (opType) {
+        console.log('本地检测到操作指令:', opType, opParams);
+        
+        // 如果MCP服务可用，尝试执行操作
+        if (isMCPAvailable.value) {
+          try {
+            // 调用MCP执行操作
+            const mcpResponse = await executeMCPOperation(opType, opParams);
+            
+            if (mcpResponse && mcpResponse.success) {
+              console.log('MCP操作执行成功:', mcpResponse);
+              
+              // 返回操作结果
+              return {
+                text: `${reply}\n\n已执行${opType}操作`,
+                success: true,
+                operation: opType,
+                parameters: opParams,
+                action: {
+                  type: opType,
+                  params: opParams
+                }
+              };
+            }
+          } catch (mcpError) {
+            console.error('MCP操作执行失败:', mcpError);
+          }
+        }
+      }
+    }
+    
+    // 如果没有检测到操作指令或MCP服务不可用，返回普通响应
     return {
       text: reply,
       success: true
     };
   } catch (error) {
     console.error('发送消息到AI服务失败:', error);
-    // 即使失败，也返回成功状态，避免中断用户交互
     return {
       text: `我遇到了一些问题，请稍后再试。详情: ${error.message}`,
-      success: true
+      success: false
     };
   }
 };
 
-// 发送消息到MCP服务器 (Send message to MCP server)
-const sendToMCPServer = async (message: string) => {
+// 直接执行MCP操作
+const executeMCPOperation = async (operation: string, parameters: any) => {
   try {
-    // 检查MCP服务是否可用
     if (!isMCPAvailable.value) {
-      throw new Error('MCP服务不可用，请切换到对话模式或稍后再试');
+      throw new Error('MCP服务不可用');
     }
     
-    // 检查消息是否为空
-    if (!message || !message.trim()) {
-      throw new Error('消息不能为空');
-    }
+    console.log(`执行MCP操作: ${operation}`, parameters);
     
-    console.log("发送消息到MCP服务:", message);
-    
-    // 尝试调用MCP服务的API
-    let apiResponse;
-    let useFallback = false;
-    
-    try {
-      // 首先尝试调用/api/llm/process接口
-      const response = await fetch('http://localhost:9000/api/llm/process', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          message,
-          model: 'claude' // 指定使用的模型
-        }),
-      });
-      
-      if (response.ok) {
-        apiResponse = await response.json();
-      } else {
-        // 如果返回404，可能是新API尚未部署，尝试使用旧的API
-        console.warn('新的/api/llm/process接口不可用，尝试备用API');
-        useFallback = true;
-      }
-    } catch (error) {
-      console.warn('调用/api/llm/process接口失败，尝试备用API:', error);
-      useFallback = true;
-    }
-    
-    // 如果需要，使用备用方法 - 直接发送到execute接口
-    if (useFallback) {
-      // 简单的命令识别逻辑
-      let operation, parameters = {};
-      
-      if (message.includes('旋转')) {
-        operation = 'rotate';
-        parameters.direction = message.includes('右') ? 'right' : 'left';
-        
-        // 提取角度
-        const angleMatch = message.match(/(\d+)\s*度/);
-        parameters.angle = angleMatch ? parseInt(angleMatch[1]) : 45;
-      } else if (message.includes('缩放') || message.includes('放大') || message.includes('缩小')) {
-        operation = 'zoom';
-        
-        // 提取比例
-        const scaleMatch = message.match(/(\d+(\.\d+)?)\s*倍/);
-        parameters.scale = scaleMatch ? parseFloat(scaleMatch[1]) : 1.5;
-        
-        if (message.includes('缩小') && parameters.scale > 1) {
-          parameters.scale = 1 / parameters.scale;
-        }
-      } else if (message.includes('聚焦') || message.includes('关注')) {
-        operation = 'focus';
-        parameters.target = message.includes('中心') ? 'center' : 'model';
-      } else if (message.includes('重置') || message.includes('复位')) {
-        operation = 'reset';
-      } else {
-        throw new Error('无法识别的模型操作命令');
-      }
-      
-      // 直接调用执行接口
-      const executeResponse = await fetch('http://localhost:9000/api/execute', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          action: operation,
-          parameters
-        })
-      });
-      
-      if (executeResponse.ok) {
-        const result = await executeResponse.json();
-        
-        // 构建与新API格式一致的响应
-        apiResponse = {
-          success: result.success,
-          message: result.message || `已执行${operation}操作`,
-          operation,
-          parameters,
-          operation_result: {
-            operation,
-            parameters,
-            success: result.success
-          }
-        };
-      } else {
-        throw new Error(`执行操作失败: ${await executeResponse.text()}`);
-      }
-    }
-    
-    console.log("收到MCP服务响应:", apiResponse);
-
-    if (apiResponse.status == 'success') {
-      // 添加AI回复到历史记录 (Add AI response to history)
-      const responseMessage: any = {
-        role: 'assistant',
-        content: apiResponse.message || '已执行您的操作指令',
-        time: formatTime(new Date())
-      };
-      
-      // 如果有操作结果，添加到消息中
-      if (apiResponse.operation_result) {
-        responseMessage.mcpOperation = {
-          operation: apiResponse.operation_result.operation,
-          parameters: apiResponse.operation_result.parameters,
-          success: true // 强制设置为true，因为apiResponse.success已经是true
-        };
-        
-        // 通知父组件执行MCP操作
-        emit('executeAction', {
-          type: 'mcp',
-          operation: apiResponse.operation_result.operation,
-          parameters: apiResponse.operation_result.parameters
-        });
-      }
-      
-      chatHistory.push(responseMessage);
-      
-      // 根据操作类型添加成功消息
-      const operationType = apiResponse.operation || apiResponse.operation_result?.operation || 'unknown';
-      // 不再添加额外的成功消息，避免重复
-      // chatHistory.push({
-      //   role: 'assistant',
-      //   content: `成功执行${operationType}操作`,
-      //   time: formatTime(new Date()),
-      //   type: 'success'
-      // });
-    } else {
-      // 添加错误消息到历史记录 (Add error message to history)
-      chatHistory.push({
-        role: 'assistant',
-        content: `操作执行失败: ${apiResponse.error || apiResponse.message || '未知错误'}`,
-        time: formatTime(new Date()),
-        type: 'error'
-      });
-    }
-  } catch (error) {
-    console.error('MCP服务请求错误:', error);
-    // 添加错误消息到历史记录
-    chatHistory.push({
-      role: 'assistant',
-      content: `操作失败: ${(error as Error).message}`,
-      time: formatTime(new Date())
+    // 调用MCP execute接口
+    const response = await fetch('http://localhost:9000/api/execute', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        action: operation,
+        parameters: parameters
+      })
     });
+    
+    if (!response.ok) {
+      throw new Error(`MCP操作失败: ${response.status}`);
+    }
+    
+    const result = await response.json();
+    return {
+      success: result.success || result.status === 'success',
+      operation: operation,
+      parameters: parameters,
+      message: result.message || `${operation}操作已执行`
+    };
+  } catch (error) {
+    console.error('MCP操作执行失败:', error);
+    throw error;
   }
 };
 
@@ -498,24 +455,8 @@ const enableModelControlMode = () => {
   // 直接设置为在线状态
   mcpServerStatus.value = 'online';
   
-  // 切换到模型操作模式
-  selectedModel.value = 'mcp';
-  
   console.log('已强制启用模型操作模式，之前的状态为:', prevStatus);
 };
-
-// 监听选择的模型变化 (Watch for selected model changes)
-watch(selectedModel, () => {
-  if (isMCPMode.value && mcpServerStatus.value === 'unknown') {
-    checkMCPServerStatus();
-  }
-  
-  // 如果选择了MCP模式但状态是offline，尝试强制启用
-  if (isMCPMode.value && mcpServerStatus.value === 'offline') {
-    console.log('尝试强制启用MCP模式');
-    mcpServerStatus.value = 'online';
-  }
-});
 
 // 组件挂载后 (After component mount)
 onMounted(() => {
@@ -736,17 +677,9 @@ defineExpose({
       <button class="close-button" @click="closeDialog">×</button>
     </div>
     
-    <div class="model-selector">
-      <label for="ai-model-select">选择模式:</label>
-      <select id="ai-model-select" v-model="selectedModel">
-        <option v-for="model in models" :key="model.value" :value="model.value" 
-                :disabled="model.value === 'mcp' && !isMCPAvailable">
-          {{ model.label }} {{ model.value === 'mcp' && !isMCPAvailable ? '(服务不可用)' : '' }}
-        </option>
-      </select>
-      
+    <div class="chat-status">
       <!-- MCP状态指示器 -->
-      <div class="mcp-status" v-if="isMCPMode" :class="mcpServerStatus">
+      <div class="mcp-status" :class="mcpServerStatus">
         <span class="status-dot"></span>
         <span>{{ mcpServerStatus === 'online' ? 'MCP服务已连接' : 
                  mcpServerStatus === 'degraded' ? 'MCP服务状态异常' : 
@@ -761,33 +694,22 @@ defineExpose({
         </button>
       </div>
       
-      <!-- 模式说明 -->
+      <!-- 一体化模式说明 -->
       <div class="mode-description">
-        <p v-if="isMCPMode">
-          <i class="mode-icon">🤖</i> 模型操作模式：可以通过自然语言直接控制3D模型
-        </p>
-        <p v-else>
-          <i class="mode-icon">💬</i> 对话模式：与AI助手对话，获取模型信息
+        <p>
+          <i class="mode-icon">🤖</i> AI助手可以回答问题和操作3D模型
         </p>
       </div>
     </div>
     
     <div class="chat-examples">
       <span>示例: </span>
-      <!-- 对话模式示例 -->
-      <template v-if="!isMCPMode">
-        <button @click="fillExample('办公室哪个区域是会议室？')">办公室哪个区域是会议室？</button>
-        <button @click="fillExample('介绍一下这个数字孪生模型')">介绍一下数字孪生模型</button>
-        <button @click="fillExample('这个模型有哪些功能？')">这个模型有哪些功能？</button>
-      </template>
-      
-      <!-- 模型操作模式示例 -->
-      <template v-else>
-        <button @click="fillExample('向左旋转模型45度')">向左旋转模型45度</button>
-        <button @click="fillExample('将模型放大1.5倍')">将模型放大1.5倍</button>
-        <button @click="fillExample('聚焦到中心区域')">聚焦到中心区域</button>
-        <button @click="fillExample('重置模型视图')">重置模型视图</button>
-      </template>
+      <!-- 混合示例 -->
+      <button @click="fillExample('办公室哪个区域是会议室？')">办公室哪个区域是会议室？</button>
+      <button @click="fillExample('向左旋转模型45度')">向左旋转模型45度</button>
+      <button @click="fillExample('将模型放大1.5倍')">将模型放大1.5倍</button>
+      <button @click="fillExample('聚焦到中心区域')">聚焦到中心区域</button>
+      <button @click="fillExample('重置模型视图')">重置模型视图</button>
     </div>
     
     <div class="chat-container" ref="chatContainerRef">
@@ -818,7 +740,7 @@ defineExpose({
         placeholder="输入您的问题或指令..."
         @keyup.enter="sendMessage"
       ></textarea>
-      <button @click="sendMessage" :disabled="isLoading || (isMCPMode && !isMCPAvailable)">发送</button>
+      <button @click="sendMessage" :disabled="isLoading || !isMCPAvailable">发送</button>
     </div>
   </div>
 </template>
@@ -861,20 +783,13 @@ defineExpose({
   cursor: pointer;
 }
 
-.model-selector {
+.chat-status {
   padding: 10px 15px;
   background-color: #f5f5f5;
   display: flex;
   flex-direction: column;
   gap: 8px;
   border-bottom: 1px solid #e0e0e0;
-}
-
-.model-selector select {
-  padding: 5px;
-  border-radius: 4px;
-  border: 1px solid #ddd;
-  width: 100%;
 }
 
 .mcp-status {

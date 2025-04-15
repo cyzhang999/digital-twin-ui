@@ -168,9 +168,31 @@ const handleChatAction = (action) => {
     return;
   }
   
+  // 获取操作类型
+  const operationType = action.type || action.operation;
+  const params = action.parameters || action.params || {};
+  
+  // 检查是否是重复操作
+  const lastOperationType = sessionStorage.getItem('last_mcp_operation_type');
+  const lastOperationTime = parseInt(sessionStorage.getItem('last_mcp_operation_time') || '0');
+  const currentTime = Date.now();
+  const timeDifference = currentTime - lastOperationTime;
+  
+  // 如果是相同类型的操作且时间差小于3秒，认为是重复操作
+  if (lastOperationType === operationType && timeDifference < 3000) {
+    console.log(`检测到重复操作: ${operationType}，跳过执行`);
+    // 清除标记，防止影响后续操作
+    sessionStorage.removeItem('last_mcp_operation_type');
+    sessionStorage.removeItem('last_mcp_operation_time');
+    return;
+  }
+
+  // 记录当前操作，防止重复执行
+  sessionStorage.setItem('last_mcp_operation_type', operationType);
+  sessionStorage.setItem('last_mcp_operation_time', currentTime.toString());
+  
   // 检查window全局对象是否有rotateModel等函数
   if (action.type === 'rotate' || action.operation === 'rotate') {
-    const params = action.parameters || action.params || {};
     const direction = params.direction || 'left';
     const angle = params.angle || 45;
     
@@ -194,7 +216,6 @@ const handleChatAction = (action) => {
   }
   // 处理缩放操作
   else if (action.type === 'zoom' || action.operation === 'zoom') {
-    const params = action.parameters || action.params || {};
     const scale = params.scale || 1.5;
     
     console.log(`执行缩放操作: 比例=${scale}`);
@@ -220,7 +241,6 @@ const handleChatAction = (action) => {
   }
   // 处理聚焦操作
   else if (action.type === 'focus' || action.operation === 'focus') {
-    const params = action.parameters || action.params || {};
     const target = params.target || 'center';
     
     console.log(`执行聚焦操作: 目标=${target}`);
@@ -232,6 +252,13 @@ const handleChatAction = (action) => {
     // 其次检查modelViewerRef中的方法
     else if (modelViewerRef.value && typeof modelViewerRef.value.focusModel === 'function') {
       modelViewerRef.value.focusModel({target});
+    }
+    // 再检查其他可能方法
+    else if (typeof window.focusOnModel === 'function') {
+      window.focusOnModel({target});
+    }
+    else if (window.app && typeof window.app.focusModel === 'function') {
+      window.app.focusModel({target});
     }
     else {
       console.error('找不到可用的聚焦方法');
