@@ -147,6 +147,53 @@ const wsManager = {
     }
     
     console.log('已断开所有WebSocket连接');
+  },
+  
+  sendCommand: async (url, command) => {
+    try {
+      const wsUrl = import.meta.env.VITE_PYTHON_WS_URL || 'ws://localhost:9000';
+      const fullUrl = `${wsUrl}${url}`;
+      
+      // 创建新的WebSocket连接
+      const ws = new WebSocket(fullUrl);
+      
+      // 连接打开时的处理
+      ws.onopen = () => {
+        console.log('WebSocket连接已建立');
+        
+        // 发送命令
+        const commandStr = JSON.stringify(command);
+        ws.send(commandStr);
+      };
+      
+      // 接收消息时的处理
+      const result = await new Promise<any>((resolve, reject) => {
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            console.log('收到WebSocket消息:', data);
+            resolve(data);
+          } catch (error) {
+            console.error('处理WebSocket消息时出错:', error);
+            reject(error);
+          }
+        };
+      });
+      
+      // 连接关闭时的处理
+      ws.onclose = () => {
+        console.log('WebSocket连接已关闭');
+      };
+      
+      // 连接错误时的处理
+      ws.onerror = (error) => {
+        console.error('WebSocket连接错误:', error);
+        reject(error);
+      };
+    } catch (error) {
+      console.error('发送WebSocket消息时出错:', error);
+      return false;
+    }
   }
 };
 
@@ -154,13 +201,16 @@ const wsManager = {
 const appStatus = ref({ connected: false });
 const healthStatus = ref({ status: 'unknown', message: '初始化中' });
 
+// 添加statusCheckInterval变量声明
+let statusCheckInterval: number | null = null;
+
 // 打开聊天对话框 (Open chat dialog)
 const openChatDialog = () => {
   chatDialogVisible.value = true;
 };
 
 // 处理聊天操作
-const handleChatAction = (action) => {
+const handleChatAction = async (action) => {
   console.log('收到聊天操作:', action);
   
   if (!modelViewerRef.value) {
@@ -190,13 +240,74 @@ const handleChatAction = (action) => {
   // 记录当前操作，防止重复执行
   sessionStorage.setItem('last_mcp_operation_type', operationType);
   sessionStorage.setItem('last_mcp_operation_time', currentTime.toString());
+
+  // 检查操作参数
+  if (operationType === 'rotate') {
+    // 确保旋转角度正确，如果请求是45度但被设置为30度，则修正
+    if (params.angle === 30 && sessionStorage.getItem('requested_angle')) {
+      const requestedAngle = parseInt(sessionStorage.getItem('requested_angle'));
+      console.log(`修正旋转角度: 从${params.angle}°改为${requestedAngle}°`);
+      params.angle = requestedAngle;
+    }
+    console.log(`准备执行旋转操作: 方向=${params.direction}, 角度=${params.angle}°`);
+  }
+
+  // 创建MCP命令，但不立即执行
+  const mcpCommand = {
+    type: 'mcp.command',
+    action: operationType,
+    parameters: params,
+    id: `cmd_${Date.now()}_${Math.floor(Math.random() * 10000)}`,
+    timestamp: new Date().toISOString(),
+    source: 'ai_response' // 标记来源为AI响应
+  };
   
-  // 检查window全局对象是否有rotateModel等函数
-  if (action.type === 'rotate' || action.operation === 'rotate') {
+  console.log('准备发送MCP命令:', mcpCommand);
+  
+  // 将命令添加到模型查看器的命令队列
+  if (modelViewerRef.value && typeof modelViewerRef.value.commandQueue !== 'undefined') {
+    console.log('添加命令到模型查看器的命令队列');
+    modelViewerRef.value.commandQueue.value.push(mcpCommand);
+  } else {
+    // 如果无法直接访问队列，则通过WebSocket发送命令
+    try {
+      // 使用WebSocket发送MCP命令
+      const mcpResult = await wsManager.sendCommand('/ws/command', mcpCommand);
+      console.log('MCP命令发送结果:', mcpResult);
+    } catch (error) {
+      // MCP命令发送失败，降级到本地操作
+      console.error('MCP命令发送失败，原因:', error);
+      console.warn('使用本地操作作为备选方案');
+      
+      // 以下是本地操作的代码，作为MCP操作失败时的备选方案
+      executeLocalOperation(operationType, params);
+    }
+  }
+  
+  // 请求执行队列中的命令
+  if (modelViewerRef.value && typeof modelViewerRef.value.executeQueuedCommands === 'function') {
+    console.log('App.vue: 即将执行队列中的命令');
+    // 短暂延迟，确保命令已进入队列
+    setTimeout(() => {
+      modelViewerRef.value.executeQueuedCommands();
+    }, 100);
+  }
+  
+  // 操作完成后清除存储的请求角度
+  if (operationType === 'rotate') {
+    sessionStorage.removeItem('requested_angle');
+  }
+};
+
+// 本地执行操作的函数
+const executeLocalOperation = (operationType, params) => {
+  // 处理旋转操作
+  if (operationType === 'rotate') {
     const direction = params.direction || 'left';
+    // 使用传入的角度参数，确保与MCP命令使用相同的角度
     const angle = params.angle || 45;
     
-    console.log(`执行旋转操作: 方向=${direction}, 角度=${angle}`);
+    console.log(`执行本地旋转操作: 方向=${direction}, 角度=${angle}`);
     
     // 优先使用全局window.rotateModel函数
     if (typeof window.rotateModel === 'function') {
@@ -215,10 +326,10 @@ const handleChatAction = (action) => {
     }
   }
   // 处理缩放操作
-  else if (action.type === 'zoom' || action.operation === 'zoom') {
+  else if (operationType === 'zoom') {
     const scale = params.scale || 1.5;
     
-    console.log(`执行缩放操作: 比例=${scale}`);
+    console.log(`执行本地缩放操作: 比例=${scale}`);
     
     // 优先使用全局window.zoomModel函数
     if (typeof window.zoomModel === 'function') {
@@ -240,10 +351,10 @@ const handleChatAction = (action) => {
     }
   }
   // 处理聚焦操作
-  else if (action.type === 'focus' || action.operation === 'focus') {
+  else if (operationType === 'focus') {
     const target = params.target || 'center';
     
-    console.log(`执行聚焦操作: 目标=${target}`);
+    console.log(`执行本地聚焦操作: 目标=${target}`);
     
     // 优先使用全局window.focusModel函数
     if (typeof window.focusModel === 'function') {
@@ -265,8 +376,8 @@ const handleChatAction = (action) => {
     }
   }
   // 处理重置操作
-  else if (action.type === 'reset' || action.operation === 'reset') {
-    console.log('执行重置视图操作');
+  else if (operationType === 'reset') {
+    console.log('执行本地重置视图操作');
     
     // 优先使用全局window.resetModel函数
     if (typeof window.resetModel === 'function') {
@@ -281,19 +392,33 @@ const handleChatAction = (action) => {
     }
   }
   else {
-    console.warn(`未知操作类型: ${action.type || action.operation}`);
+    console.warn(`未知操作类型: ${operationType}`);
   }
 };
 
-// 修改生命周期钩子，连接WebSocket
+// 组件挂载时执行
 onMounted(async () => {
   // 连接WebSocket
   await wsManager.connectStatus();
   await wsManager.connectHealth();
   
-  // 不再使用HTTP请求检查状态
-  // checkStatus();
-  // setInterval(checkStatus, 30000);
+  // 初始化MCP WebSocket连接
+  initWebSocket();
+  
+  // 添加事件监听器，执行队列中的命令
+  window.addEventListener('execute-queued-commands', () => {
+    if (modelViewerRef.value && typeof modelViewerRef.value.executeQueuedCommands === 'function') {
+      console.log('App.vue: 响应execute-queued-commands事件，执行队列命令');
+      modelViewerRef.value.executeQueuedCommands();
+    }
+  });
+  
+  // 添加测试按钮的事件处理
+  document.querySelector('#rotate-left-btn')?.addEventListener('click', () => rotateThroughMCP('left', 15));
+  document.querySelector('#rotate-right-btn')?.addEventListener('click', () => rotateThroughMCP('right', 15));
+  document.querySelector('#zoom-in-btn')?.addEventListener('click', () => zoomThroughMCP(1.2));
+  document.querySelector('#zoom-out-btn')?.addEventListener('click', () => zoomThroughMCP(0.8));
+  document.querySelector('#reset-btn')?.addEventListener('click', () => resetThroughMCP());
 });
 
 // 组件卸载前执行
@@ -301,14 +426,22 @@ onBeforeUnmount(() => {
   // 断开WebSocket连接
   wsManager.disconnect();
   
-  // 清除定时器
-  if (statusCheckInterval) {
+  // 移除事件监听器
+  window.removeEventListener('execute-queued-commands', () => {});
+  
+  // 安全地清除定时器
+  if (typeof statusCheckInterval === 'number') {
     clearInterval(statusCheckInterval);
+    statusCheckInterval = null;
   }
   
-  // 关闭WebSocket连接
+  // 安全地关闭WebSocket连接
   if (wsConnection.value) {
-    wsConnection.value.close();
+    try {
+      wsConnection.value.close();
+    } catch (e) {
+      console.error('关闭WebSocket连接时出错:', e);
+    }
     wsConnection.value = null;
   }
   
@@ -534,19 +667,6 @@ const resetThroughMCP = () => {
   
   return sendCommand(message);
 };
-
-// 组件挂载时执行
-onMounted(() => {
-  // 初始化WebSocket连接
-  initWebSocket();
-  
-  // 添加测试按钮的事件处理
-  document.querySelector('#rotate-left-btn')?.addEventListener('click', () => rotateThroughMCP('left', 15));
-  document.querySelector('#rotate-right-btn')?.addEventListener('click', () => rotateThroughMCP('right', 15));
-  document.querySelector('#zoom-in-btn')?.addEventListener('click', () => zoomThroughMCP(1.2));
-  document.querySelector('#zoom-out-btn')?.addEventListener('click', () => zoomThroughMCP(0.8));
-  document.querySelector('#reset-btn')?.addEventListener('click', () => resetThroughMCP());
-});
 </script>
 
 <template>

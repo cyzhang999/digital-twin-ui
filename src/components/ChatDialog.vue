@@ -31,6 +31,9 @@ const isLoading = ref(false);
 //   { value: 'mcp', label: '模型操作模式' }
 // ];
 
+// 添加selectedModel变量，修复未定义问题
+const selectedModel = ref('default');
+
 // MCP服务器状态 (MCP server status)
 const mcpServerStatus = ref('unknown');
 
@@ -53,6 +56,9 @@ const isMCPAvailable = computed(() => {
 const closeDialog = () => {
   emit('update:modelVisible', false);
 };
+
+// 添加延迟函数
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 // 发送消息 (Send message)
 const sendMessage = async () => {
@@ -89,9 +95,10 @@ const sendMessage = async () => {
     // 先快速检测是否包含操作指令 (预检测)
     const detectedOperation = detectOperation(message);
     
-    // 如果预检测到操作类型，记录到会话存储中
+    // 如果预检测到操作类型，仅记录到会话存储中，但不立即执行
     if (detectedOperation) {
-      // 将操作类型保存到会话存储中
+      console.log('预检测到操作指令:', detectedOperation.operation);
+      // 仅记录操作类型，不执行操作
       sessionStorage.setItem(`last_mcp_operation_type`, detectedOperation.operation);
       sessionStorage.setItem(`last_mcp_operation_time`, Date.now().toString());
     }
@@ -113,6 +120,15 @@ const sendMessage = async () => {
         } : undefined
       });
       
+      // 确保UI更新，AI回复显示出来
+      await nextTick();
+      scrollToBottom();
+      
+      // 延迟执行操作，确保AI回复先显示
+      // 增加到1000ms延迟，确保UI完全渲染并且用户能看到AI回复
+      console.log('延迟执行模型操作，等待AI回复显示...');
+      await delay(1000);
+      
       // 如果AI服务检测到操作指令并返回了action或operation
       if (aiResponse.action || aiResponse.operation) {
         // 优先使用返回的action对象
@@ -121,9 +137,31 @@ const sendMessage = async () => {
           params: aiResponse.parameters || {}
         };
         
-        // 发出操作事件
+        // 尝试检查角度参数
+        if ((actionObj.type === 'rotate' || actionObj.operation === 'rotate') && 
+            sessionStorage.getItem('requested_angle')) {
+          const requestedAngle = parseInt(sessionStorage.getItem('requested_angle'));
+          const currentAngle = actionObj.params?.angle || actionObj.parameters?.angle;
+          
+          if (currentAngle && currentAngle !== requestedAngle) {
+            console.log(`修正旋转角度: 从${currentAngle}°改为${requestedAngle}°`);
+            
+            // 修正角度参数
+            if (actionObj.params) {
+              actionObj.params.angle = requestedAngle;
+            } else if (actionObj.parameters) {
+              actionObj.parameters.angle = requestedAngle;
+            }
+          }
+        }
+        
+        // 延迟后发出操作事件 - 确保AI回复显示后再执行操作
+        console.log('现在执行模型操作:', actionObj);
         emit('executeAction', actionObj);
       }
+      
+      // 执行队列中的命令
+      executeQueuedCommands();
     } else {
       // 处理失败情况
       chatHistory.push({
@@ -151,6 +189,29 @@ const sendMessage = async () => {
   }
 };
 
+// 执行队列中的命令
+const executeQueuedCommands = () => {
+  // 获取父组件传来的模型查看器引用
+  const parentElement = document.querySelector('.chat-dialog')?.parentElement;
+  if (!parentElement) {
+    console.warn('无法找到父元素，无法执行队列命令');
+    return;
+  }
+  
+  // 尝试获取模型查看器组件
+  const modelViewer = parentElement.__vue__?.refs?.modelViewer || 
+                       parentElement.__vue__?.setupState?.modelViewerRef?.value;
+  
+  if (modelViewer && typeof modelViewer.executeQueuedCommands === 'function') {
+    console.log('调用modelViewer.executeQueuedCommands执行队列命令');
+    modelViewer.executeQueuedCommands();
+  } else {
+    // 尝试通过事件触发执行队列命令
+    console.log('通过事件触发执行队列命令');
+    window.dispatchEvent(new CustomEvent('execute-queued-commands'));
+  }
+};
+
 // 快速检测操作类型
 const detectOperation = (message: string) => {
   // 简单的命令识别逻辑
@@ -158,9 +219,22 @@ const detectOperation = (message: string) => {
 
   if (message.includes('旋转')) {
     operation = 'rotate';
+    
+    // 检测角度
+    const angleMatch = message.match(/(\d+)\s*度/);
+    const angle = angleMatch ? parseInt(angleMatch[1]) : 45;
+    
+    // 检测方向
+    const direction = message.includes('右') ? 'right' : 'left';
+    
+    // 保存用户请求的角度和方向到sessionStorage
+    sessionStorage.setItem('requested_angle', angle.toString());
+    sessionStorage.setItem('requested_direction', direction);
+    console.log(`检测到旋转角度: ${angle}°, 方向: ${direction}，已保存到sessionStorage`);
+    
     parameters = {
-      direction: message.includes('右') ? 'right' : 'left',
-      angle: message.match(/(\d+)\s*度/) ? parseInt(message.match(/(\d+)\s*度/)[1]) : 45
+      direction: direction,
+      angle: angle
     };
   } else if (message.includes('缩放') || message.includes('放大') || message.includes('缩小')) {
     operation = 'zoom';
@@ -283,40 +357,24 @@ const sendToDifyServer = async (message: string) => {
       }
     }
     
-    // 如果后端未检测到操作指令，但我们本地检测到了
-    if (detectedOperation && isMCPAvailable.value) {
-      const opType = detectedOperation.operation;
-      const opParams = detectedOperation.parameters;
+    // 注释掉本地检测到操作指令时立即执行的部分
+    // 如果后端未检测到操作指令，但我们本地检测到了，不做任何操作
+    // 让操作统一通过AI回复后的回调来执行
+    if (detectedOperation) {
+      console.log('本地检测到操作指令，但不立即执行，等待AI响应:', detectedOperation.operation);
       
-      // 如果是有效的操作类型
-      if (opType) {
-        console.log('本地检测到操作指令:', opType, opParams);
-        
-        // 如果MCP服务可用，尝试执行操作
-        if (isMCPAvailable.value) {
-          try {
-            // 调用MCP执行操作
-            const mcpResponse = await executeMCPOperation(opType, opParams);
-            
-            if (mcpResponse && mcpResponse.success) {
-              console.log('MCP操作执行成功:', mcpResponse);
-              
-              // 返回操作结果
-              return {
-                text: `${reply}\n\n已执行${opType}操作`,
-                success: true,
-                operation: opType,
-                parameters: opParams,
-                action: {
-                  type: opType,
-                  params: opParams
-                }
-              };
-            }
-          } catch (mcpError) {
-            console.error('MCP操作执行失败:', mcpError);
+      // 仍然返回检测到的操作信息，以便AI响应回调时使用
+      if (detectedOperation.operation) {
+        return {
+          text: reply,
+          success: true,
+          operation: detectedOperation.operation,
+          parameters: detectedOperation.parameters,
+          action: {
+            type: detectedOperation.operation,
+            params: detectedOperation.parameters
           }
-        }
+        };
       }
     }
     
@@ -477,8 +535,11 @@ onMounted(() => {
     checkMCPServerStatus();
   }, 1000);
   
+  // 声明变量避免未定义
+  let statusCheckInterval: number;
+  
   // 然后每5秒检查一次MCP服务状态，确保状态及时更新
-  const statusCheckInterval = setInterval(() => {
+  statusCheckInterval = setInterval(() => {
     checkMCPServerStatus();
   }, 5000);
   
@@ -548,7 +609,26 @@ const handleMessage = async (message: string) => {
             }
           });
           
-          // 发出操作事件
+          // 确保UI更新，AI回复显示出来
+          await nextTick();
+          scrollToBottom();
+          
+          // 如果是旋转操作，检查并修正角度
+          if (result.action === 'rotate' && result.parameters) {
+            // 确保角度参数正确，如果用户要求45度但被设置为30度，则修复它
+            const userAngle = message.match(/(\d+)\s*度/) ? parseInt(message.match(/(\d+)\s*度/)[1]) : null;
+            if (userAngle && result.parameters.angle && result.parameters.angle !== userAngle) {
+              console.log(`修正旋转角度: 从${result.parameters.angle}°改为${userAngle}°`);
+              result.parameters.angle = userAngle;
+            }
+          }
+          
+          // 延迟执行操作
+          console.log('延迟执行模型操作，等待AI回复显示...');
+          await delay(1000);
+          
+          // 延迟后发出操作事件
+          console.log('现在执行模型操作:', result.action);
           emit('executeAction', {
             type: 'mcp',
             operation: result.action,
@@ -587,7 +667,7 @@ const sendToAI = async (message: string) => {
     
     // 发送API请求
     const response = await fetch(
-      'http://localhost:8089/api/chat',
+      'http://localhost:8089/api/chat',  // 添加缺失的API URL
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -607,6 +687,14 @@ const sendToAI = async (message: string) => {
       content: result.response || result.message || '无响应',
       time: formatTime(new Date())
     });
+    
+    // 确保UI更新，AI回复显示出来
+    await nextTick();
+    scrollToBottom();
+    
+    // 延迟执行操作，确保AI回复先显示
+    console.log('延迟执行模型操作，等待AI回复显示...');
+    await delay(1000);
     
     // 如果返回了操作指令
     if (result.action) {
@@ -634,13 +722,17 @@ const sendToAI = async (message: string) => {
           }
         });
         
-        // 发出操作事件
+        // 延迟后发出操作事件
+        console.log('现在执行模型操作:', operation);
         emit('executeAction', {
           type: operation,
           operation,
           params: parameters,
           parameters
         });
+        
+        // 执行队列中的命令
+        executeQueuedCommands();
       } catch (actionError) {
         console.error('执行AI返回的操作失败:', actionError);
         

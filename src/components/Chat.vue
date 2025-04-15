@@ -4,7 +4,7 @@ function handleChatAction(action) {
   
   if (action.type === 'rotate' || action.operation === 'rotate') {
     const direction = action.parameters?.direction || 'left';
-    const angle = action.parameters?.angle || 30;
+    const angle = action.parameters?.angle || 45;
     
     console.log(`执行旋转操作: 方向=${direction}, 角度=${angle}`);
     

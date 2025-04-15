@@ -956,6 +956,10 @@ const generateClientId = () => {
   return sessionId;
 };
 
+// 添加命令队列和执行状态
+const commandQueue = ref([]);
+const isExecutingCommands = ref(false);
+
 // 添加WebSocket命令监听
 const setupWebSocketCommandListener = () => {
   console.log('设置WebSocket命令监听...');
@@ -971,25 +975,147 @@ const setupWebSocketCommandListener = () => {
         
         console.log(`接收到WebSocket MCP命令: ${operation}`, params);
         
-        // 执行对应操作
+        // 检查并修正角度参数
         if (operation === 'rotate') {
-          window.rotateModel(params);
-        } else if (operation === 'zoom') {
-          window.zoomModel(params);
-        } else if (operation === 'focus') {
-          // 执行聚焦操作
-          window.focusModel(params);
-        } else if (operation === 'reset') {
-          // 重置操作...
-          if (typeof window.resetModel === 'function') {
-            window.resetModel();
+          // 获取前端保存的用户请求的角度
+          const requestedAngle = sessionStorage.getItem('requested_angle');
+          const requestedDirection = sessionStorage.getItem('requested_direction');
+          
+          if (requestedAngle) {
+            const userAngle = parseInt(requestedAngle);
+            
+            // 如果用户请求的角度与WebSocket发来的不同，则修正
+            if (userAngle !== params.angle) {
+              console.log(`修正WebSocket旋转角度: 从${params.angle}°改为${userAngle}°`);
+              params.angle = userAngle;
+            }
           }
+          
+          // 如果有保存方向且与WebSocket发来的不同，也修正
+          if (requestedDirection && requestedDirection !== params.direction) {
+            console.log(`修正WebSocket旋转方向: 从${params.direction}改为${requestedDirection}`);
+            params.direction = requestedDirection;
+          }
+        }
+        
+        // 不立即执行，而是将命令加入队列
+        const command = {
+          operation,
+          params,
+          id: data.id || `cmd_${Date.now()}_${Math.floor(Math.random() * 10000)}`,
+          timestamp: new Date().toISOString(),
+          source: 'websocket'
+        };
+        
+        // 将命令加入队列
+        commandQueue.value.push(command);
+        console.log(`命令已加入队列，当前队列长度: ${commandQueue.value.length}`, commandQueue.value);
+        
+        // 触发命令队列已更新事件
+        if (window && window.dispatchEvent) {
+          window.dispatchEvent(new CustomEvent('mcp-command-queued', { detail: command }));
         }
       }
     });
   }).catch(err => {
     console.error('连接WebSocket失败:', err);
   });
+};
+
+// 执行队列中的命令
+const executeQueuedCommands = async () => {
+  // 如果队列为空或者已经在执行，则返回
+  if (commandQueue.value.length === 0 || isExecutingCommands.value) {
+    return;
+  }
+  
+  try {
+    // 设置执行状态
+    isExecutingCommands.value = true;
+    console.log('开始执行队列中的命令，共有', commandQueue.value.length, '个命令');
+    
+    // 复制队列并清空原队列
+    const commands = [...commandQueue.value];
+    commandQueue.value = [];
+    
+    // 顺序执行命令
+    for (const command of commands) {
+      console.log('执行命令:', command);
+      
+      try {
+        // 检查WebSocket连接是否活跃
+        if (wsManager.isConnectionActive('/ws/command')) {
+          // 构建MCP命令格式
+          const mcpCommand = {
+            type: 'mcp.command',
+            operation: command.operation,
+            parameters: command.params,
+            id: command.id || `cmd_${Date.now()}_${Math.floor(Math.random() * 10000)}`,
+            timestamp: command.timestamp || new Date().toISOString()
+          };
+          
+          console.log('通过MCP服务器执行命令:', mcpCommand);
+          
+          try {
+            // 发送命令到MCP服务器
+            const result = await wsManager.sendCommand('/ws/command', mcpCommand);
+            console.log('MCP服务器命令执行结果:', result);
+            
+            // 即使服务器返回结果，仍短暂等待以确保操作完成
+            await new Promise(resolve => setTimeout(resolve, 200));
+            continue; // 命令已执行，继续下一个命令
+          } catch (wsError) {
+            // WebSocket发送失败，记录错误并降级到本地实现
+            console.error('通过MCP服务器执行命令失败，降级到本地实现:', wsError);
+            // 继续执行下面的本地实现代码
+          }
+        } else {
+          console.warn('WebSocket连接不可用，使用本地操作执行命令');
+        }
+        
+        // 本地实现（降级方案）
+        if (command.operation === 'rotate') {
+          // 执行旋转操作
+          if (typeof window.rotateModel === 'function') {
+            console.log('执行本地旋转操作:', command.params);
+            window.rotateModel(command.params);
+          }
+        } else if (command.operation === 'zoom') {
+          // 执行缩放操作
+          if (typeof window.zoomModel === 'function') {
+            console.log('执行本地缩放操作:', command.params);
+            window.zoomModel(command.params);
+          }
+        } else if (command.operation === 'focus') {
+          // 执行聚焦操作
+          if (typeof window.focusModel === 'function') {
+            console.log('执行本地聚焦操作:', command.params);
+            window.focusModel(command.params);
+          }
+        } else if (command.operation === 'reset') {
+          // 执行重置操作
+          if (typeof window.resetModel === 'function') {
+            console.log('执行本地重置操作');
+            window.resetModel();
+          }
+        } else {
+          console.warn('未知操作类型:', command.operation);
+        }
+      } catch (commandError) {
+        console.error(`执行命令失败: ${command.operation}`, commandError);
+      }
+      
+      // 执行命令间添加短暂延迟，避免连续操作太快
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+    
+    console.log('所有队列命令执行完成');
+  } catch (error) {
+    console.error('执行队列命令时出错:', error);
+  } finally {
+    // 重置执行状态
+    isExecutingCommands.value = false;
+  }
 };
 
 // 组件挂载时的初始化
@@ -1018,6 +1144,18 @@ onMounted(async () => {
       // 连接命令WebSocket（优先级最高）
       await wsManager.connect('/ws/command');
       console.log('已连接到命令WebSocket');
+      
+      // 添加5秒定时器检查命令WebSocket连接状态
+      setInterval(() => {
+        const isActive = wsManager.isConnectionActive('/ws/command');
+        console.log(`命令WebSocket连接状态: ${isActive ? '活跃' : '不可用'}`);
+        if (!isActive) {
+          console.warn('命令WebSocket连接不可用，尝试重新连接');
+          wsManager.connect('/ws/command').catch(err => {
+            console.error('重新连接命令WebSocket失败:', err);
+          });
+        }
+      }, 5000);
       
       // 短暂延迟后连接状态WebSocket
       await new Promise(resolve => setTimeout(resolve, 300));
@@ -1227,21 +1365,21 @@ const rotateModel = async (params) => {
 
     // 检查WebSocket连接是否活跃
     if (!wsManager.isConnectionActive('/ws/command')) {
-      console.error('命令WebSocket连接未就绪，尝试重新连接');
+      console.warn('命令WebSocket连接未就绪，尝试重新连接');
       try {
         await wsManager.connect('/ws/command');
         console.log('已重新连接到命令WebSocket');
       } catch (connError) {
         console.error('重新连接命令WebSocket失败:', connError);
-        // 失败后使用本地旋转实现
+        console.warn('降级到本地旋转实现');
         return executeLocalRotate(params);
       }
     }
 
-    // 创建并发送旋转命令 - 简化命令格式
+    // 创建并发送旋转命令 - 确保使用MCP标准格式
     const command = {
       type: 'mcp.command',
-      action: 'rotate',
+      operation: 'rotate',
       parameters: {
         direction: params.direction || 'left',
         angle: params.angle || 45
@@ -1250,15 +1388,21 @@ const rotateModel = async (params) => {
       timestamp: new Date().toISOString()
     };
     
-    console.log('发送MCP旋转命令:', command);
+    console.log('发送MCP旋转命令到服务器:', command);
     
-    const result = await wsManager.sendCommand('/ws/command', command);
-    console.log('旋转命令执行结果:', result);
-
-    return result?.success || result?.status === 'success' || true;
+    try {
+      const result = await wsManager.sendCommand('/ws/command', command);
+      console.log('MCP服务器旋转命令执行结果:', result);
+      return result?.success || result?.status === 'success' || true;
+    } catch (wsError) {
+      console.error('与MCP服务器通信失败:', wsError);
+      console.warn('降级到本地旋转实现');
+      return executeLocalRotate(params);
+    }
   } catch (error) {
     console.error('旋转命令执行失败:', error);
     // 出错时尝试使用本地实现
+    console.warn('降级到本地旋转实现');
     return executeLocalRotate(params);
   }
 };
@@ -1330,21 +1474,21 @@ const zoomModel = async (params) => {
 
     // 检查WebSocket连接是否活跃
     if (!wsManager.isConnectionActive('/ws/command')) {
-      console.error('命令WebSocket连接未就绪，尝试重新连接');
+      console.warn('命令WebSocket连接未就绪，尝试重新连接');
       try {
         await wsManager.connect('/ws/command');
         console.log('已重新连接到命令WebSocket');
       } catch (connError) {
         console.error('重新连接命令WebSocket失败:', connError);
-        // 失败后使用本地缩放实现
+        console.warn('降级到本地缩放实现');
         return executeLocalZoom(params);
       }
     }
 
-    // 创建并发送缩放命令 - 简化命令格式
+    // 创建并发送缩放命令 - 确保使用MCP标准格式
     const command = {
       type: 'mcp.command',
-      action: 'zoom',
+      operation: 'zoom',
       parameters: {
         scale: params.scale || 1.5
       },
@@ -1352,16 +1496,21 @@ const zoomModel = async (params) => {
       timestamp: new Date().toISOString()
     };
     
-    console.log('发送MCP缩放命令:', command);
+    console.log('发送MCP缩放命令到服务器:', command);
     
-    const result = await wsManager.sendCommand('/ws/command', command);
-    console.log('缩放命令执行结果:', result);
-
-    return result?.success || result?.status === 'success' || true;
+    try {
+      const result = await wsManager.sendCommand('/ws/command', command);
+      console.log('MCP服务器缩放命令执行结果:', result);
+      return result?.success || result?.status === 'success' || true;
+    } catch (wsError) {
+      console.error('与MCP服务器通信失败:', wsError);
+      console.warn('降级到本地缩放实现');
+      return executeLocalZoom(params);
+    }
   } catch (error) {
     console.error('缩放命令执行失败:', error);
-    
     // 出错时尝试使用本地实现
+    console.warn('降级到本地缩放实现');
     return executeLocalZoom(params);
   }
 };
@@ -1603,7 +1752,8 @@ defineExpose({
   mcpFocus,
   mcpReset,
   mcpStatus,
-  mcpConnected
+  mcpConnected,
+  executeQueuedCommands
 });
 </script>
 
