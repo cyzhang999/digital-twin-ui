@@ -51,19 +51,30 @@ declare global {
 
     // 聚焦动画ID
     __focusAnimationId?: number;
+
+    // 当前旋转参数
+    currentRotationParams?: { direction: string, angle: number };
   }
 }
 
 // 导入 Three.js 相关依赖 (Import Three.js dependencies)
-import { ref, onMounted, onBeforeUnmount } from 'vue';
+import { ref, reactive, onMounted, onBeforeUnmount, computed, watch, watchEffect, nextTick } from 'vue';
 import * as THREE from 'three';
-import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader';
-import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader';
-import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls';
-
-// 导入MCP客户端类型
-import type { MCPClient } from '../utils/MCPClient';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { getMCPClient } from '../utils/MCPClient';
 import { WebSocketManager } from '../utils/WebSocketManager';
+import CommandStateManager from '@/utils/CommandStateManager';
+import { useWebSocket } from '@/composables/useWebSocket';
+import { useToast } from 'vue-toast-notification';
+
+// 创建命令状态管理器实例
+const commandStateManager = new CommandStateManager({
+  recordTTL: 8000,          // 命令记录保留8秒
+  maxLockTime: 10000,       // 最大锁定时间10秒
+  similarityThreshold: 0.75 // 参数相似度阈值
+});
 
 // 定义响应式状态 (Define reactive state)
 const canvasRef = ref<HTMLCanvasElement | null>(null);
@@ -161,7 +172,9 @@ const exposeThreeJSObjects = () => {
 };
 
 // 创建WebSocket管理器实例
-const wsManager = new WebSocketManager();
+const wsManager = new WebSocketManager({
+  logLevel: 'warn' // 只显示警告和错误信息，不显示调试和一般信息
+});
 
 // 初始化场景 (Initialize scene)
 const initScene = () => {
@@ -510,9 +523,18 @@ const zoomPart = (part: THREE.Object3D, scaleFactor: number) => {
 
 // 实现重置模型方法
 const resetModel = async () => {
-  console.log('执行重置模型操作');
-
   try {
+    console.log('执行重置命令');
+
+    // 检查是否近期已执行过相似命令
+    if (commandStateManager.isCommandExecuted('reset', {})) {
+      console.log(`近期已执行过相似的reset命令，跳过执行`);
+      return true; // 返回成功，因为操作效果已经实现
+    }
+
+    // 注册新命令
+    const commandKey = commandStateManager.registerCommand('reset', {});
+
     // 检查THREE.js对象是否已初始化
     if (!scene || !camera || !renderer || !controls) {
       console.error('THREE.js对象未完全初始化');
@@ -520,55 +542,60 @@ const resetModel = async () => {
     }
 
     // 检查WebSocket连接是否活跃
-    if (wsManager && wsManager.isConnectionActive('/ws/command')) {
-      console.log('使用WebSocket发送重置命令');
-
-      // 创建重置命令
-      const command = {
-        type: 'mcp.command',
-        action: 'reset',
-        parameters: {},
-        id: `cmd_${Date.now()}_${Math.floor(Math.random() * 10000)}`,
-        timestamp: new Date().toISOString()
-      };
-
+    if (!wsManager.isConnectionActive('/ws/command')) {
+      console.warn('命令WebSocket连接未就绪，尝试重新连接');
       try {
-        // 发送命令到MCP服务器
-        const result = await wsManager.sendCommand('/ws/command', command);
-        console.log('重置命令执行结果:', result);
-        return true;
-      } catch (error) {
-        // WebSocket通信失败，使用本地实现
-        console.error('通过WebSocket重置失败:', error);
+        await wsManager.connect('/ws/command');
+        console.log('已重新连接到命令WebSocket');
+      } catch (connError) {
+        console.error('重新连接命令WebSocket失败:', connError);
         console.warn('降级到本地重置实现');
+        const result = executeLocalReset();
+        if (result) {
+          commandStateManager.markAsExecuted(commandKey);
+        }
+        return result;
       }
-    } else {
-      console.log('WebSocket连接不可用，使用本地重置');
     }
 
-    // 本地重置实现 - 重置相机位置和控制器
-    if (camera && controls) {
-      // 重置相机位置
-      const defaultPosition = window.__defaultCameraPosition || new THREE.Vector3(0, 5, 10);
-      camera.position.copy(defaultPosition);
+    // 创建并发送重置命令 - 确保使用MCP标准格式
+    const command = {
+      type: 'mcp.command',
+      operation: 'reset',
+      parameters: {},
+      id: `cmd_${Date.now()}_${Math.floor(Math.random() * 10000)}`,
+      timestamp: new Date().toISOString()
+    };
 
-      // 重置控制器目标
-      controls.target.set(0, 0, 0);
+    console.log('发送MCP重置命令到服务器:', command);
 
-      // 更新控制器
-      controls.update();
-
-      // 渲染场景
-      renderer.render(scene, camera);
-
-      console.log('本地重置操作执行完成');
-      return true;
+    try {
+      const result = await wsManager.sendCommand('/ws/command', command);
+      console.log('MCP服务器重置命令执行结果:', result);
+      
+      // 执行本地操作保持视觉一致性
+      const localResult = executeLocalReset();
+      
+      // 标记命令为已执行
+      if (result?.success || result?.status === 'success' || localResult) {
+        commandStateManager.markAsExecuted(commandKey);
+      }
+      
+      return result?.success || result?.status === 'success' || true;
+    } catch (wsError) {
+      console.error('与MCP服务器通信失败:', wsError);
+      console.warn('降级到本地重置实现');
+      const result = executeLocalReset();
+      if (result) {
+        commandStateManager.markAsExecuted(commandKey);
+      }
+      return result;
     }
-
-    return false;
   } catch (error) {
-    console.error('重置操作执行出错:', error);
-    return false;
+    console.error('重置命令执行失败:', error);
+    // 出错时尝试使用本地实现
+    console.warn('降级到本地重置实现');
+    return executeLocalReset();
   }
 };
 
@@ -988,6 +1015,9 @@ const generateClientId = () => {
 // 添加命令队列和执行状态
 const commandQueue = ref([]);
 const isExecutingCommands = ref(false);
+// 跟踪当前正在执行的命令ID，全局声明避免重复初始化
+let executingCommandId = null;
+let lastExecutedCommandTimestamp = null;
 
 // 添加WebSocket命令监听
 const setupWebSocketCommandListener = () => {
@@ -1005,110 +1035,195 @@ const setupWebSocketCommandListener = () => {
 
 // 执行队列中的命令
 const executeQueuedCommands = async () => {
-  // 如果队列为空或者已经在执行，则返回
-  if (commandQueue.value.length === 0 || isExecutingCommands.value) {
+  // 防止重复调用
+  if (isExecutingCommands.value) {
+    console.log('命令队列已在执行中');
+    return;
+  }
+
+  // 检查队列是否为空
+  if (commandQueue.value.length === 0) {
+    console.log('命令队列为空');
+    return;
+  }
+
+  // 尝试获取命令锁
+  if (!commandStateManager.acquireLock()) {
+    console.log('无法获取命令锁，稍后重试');
+    setTimeout(() => executeQueuedCommands(), 500);
     return;
   }
 
   try {
     // 设置执行状态
     isExecutingCommands.value = true;
-    console.log('开始执行队列中的命令，共有', commandQueue.value.length, '个命令');
+    console.log(`开始执行命令队列，队列长度: ${commandQueue.value.length}`);
 
-    // 复制队列并清空原队列
-    const commands = [...commandQueue.value];
-    commandQueue.value = [];
+    // 取出队列中第一个命令
+    const command = commandQueue.value.shift();
+    const { id, operation, params } = command;
 
-    // 顺序执行命令
-    for (const command of commands) {
-      console.log('执行命令:', command);
+    console.log(`执行命令: ${operation}`, params);
 
-      try {
-        // 检查WebSocket连接是否活跃
-        if (wsManager.isConnectionActive('/ws/command')) {
-          // 构建MCP命令格式
-          const mcpCommand = {
-            type: 'mcp.command',
-            operation: command.operation,
-            parameters: command.params,
-            id: command.id || `cmd_${Date.now()}_${Math.floor(Math.random() * 10000)}`,
-            timestamp: command.timestamp || new Date().toISOString()
-          };
+    // 根据操作类型执行不同命令
+    let result = { success: false };
 
-          console.log('通过MCP服务器执行命令:', mcpCommand);
-
-          try {
-            // 发送命令到MCP服务器
-            const result = await wsManager.sendCommand('/ws/command', mcpCommand);
-            console.log('MCP服务器命令执行结果:', result);
-
-            // 根据服务器返回的结果执行本地操作
-            if (result && result.status === 'success') {
-              console.log('服务器命令成功，检查是否需要执行本地操作');
-
-              // 根据命令类型执行相应的本地操作
-              if (command.operation === 'zoom') {
-                console.log('执行本地缩放操作');
-                executeLocalZoom(command.params);
-              } else if (command.operation === 'rotate') {
-                console.log('执行本地旋转操作');
-                executeLocalRotate(command.params);
-              } else if (command.operation === 'focus') {
-                console.log('执行本地聚焦操作');
-                executeLocalFocus(command.params);
-              } else if (command.operation === 'reset') {
-                console.log('执行本地重置操作');
-                executeResetModel();
-              }
-            }
-
-            // 即使服务器返回结果，仍短暂等待以确保操作完成
-            await new Promise(resolve => setTimeout(resolve, 200));
-            continue; // 命令已执行，继续下一个命令
-          } catch (wsError) {
-            // WebSocket发送失败，记录错误并降级到本地实现
-            console.error('通过MCP服务器执行命令失败，降级到本地实现:', wsError);
-            // 继续执行下面的本地实现代码
-          }
-        } else {
-          console.warn('WebSocket连接不可用，使用本地操作执行命令');
-        }
-
-        // 本地实现（降级方案）
-        if (command.operation === 'rotate') {
-          // 执行旋转操作
-          executeLocalRotate(command.params);
-        } else if (command.operation === 'zoom') {
-          // 执行缩放操作
-          executeLocalZoom(command.params);
-        } else if (command.operation === 'focus') {
-          // 执行聚焦操作
-          if (typeof executeLocalFocus === 'function') {
-            executeLocalFocus(command.params);
-          } else if (typeof window.focusModel === 'function') {
-            console.log('执行本地聚焦操作:', command.params);
-            window.focusModel(command.params);
-          }
-        } else if (command.operation === 'reset') {
-          // 执行重置操作
-          executeResetModel();
-        } else {
-          console.warn('未知操作类型:', command.operation);
-        }
-      } catch (commandError) {
-        console.error(`执行命令失败: ${command.operation}`, commandError);
-      }
-
-      // 执行命令间添加短暂延迟，避免连续操作太快
-      await new Promise(resolve => setTimeout(resolve, 200));
+    switch (operation) {
+      case 'rotate':
+        result = await executeRotate(params);
+        break;
+      case 'zoom':
+        result = await executeZoom(params);
+        break;
+      case 'focus':
+        result = await executeFocus(params);
+        break;
+      case 'reset':
+        result = await executeReset(params);
+        break;
+      default:
+        console.warn(`未知操作类型: ${operation}`);
+        result = { success: false, error: '未知操作类型' };
     }
 
-    console.log('所有队列命令执行完成');
+    // 记录命令执行结果
+    commandStateManager.markAsExecuted(id, result);
+
+    // 命令执行后添加延迟，确保UI有时间响应，增强用户体验
+    await new Promise(resolve => setTimeout(resolve, 1500));
+
+    // 继续执行队列中的下一个命令
+    if (commandQueue.value.length > 0) {
+      executeQueuedCommands();
+    } else {
+      console.log('命令队列已清空');
+      isExecutingCommands.value = false;
+      commandStateManager.releaseLock();
+    }
   } catch (error) {
-    console.error('执行队列命令时出错:', error);
-  } finally {
-    // 重置执行状态
+    console.error('执行命令队列时出错:', error);
+    // 出错时清空队列，避免卡住
+    commandQueue.value = [];
     isExecutingCommands.value = false;
+    commandStateManager.releaseLock();
+  }
+};
+
+/**
+ * 执行旋转命令
+ * @param {Object} params - 旋转参数
+ * @returns {Promise<Object>} - 执行结果
+ */
+const executeRotate = async (params) => {
+  try {
+    if (params.axis && params.angle) {
+      const result = await mcpRotate(params.axis, params.angle);
+      return { success: true, result };
+    }
+    return { success: false, error: '旋转参数无效' };
+  } catch (error) {
+    console.error('执行旋转命令时出错:', error);
+    return { success: false, error: error.message };
+  }
+};
+
+/**
+ * 执行缩放命令
+ * @param {Object} params - 缩放参数
+ * @returns {Promise<Object>} - 执行结果
+ */
+const executeZoom = async (params) => {
+  try {
+    if (params.direction) {
+      const distance = params.distance || 1;
+      if (params.direction === 'in') {
+        const result = await mcpZoom('in', distance);
+        return { success: true, result };
+      } else if (params.direction === 'out') {
+        const result = await mcpZoom('out', distance);
+        return { success: true, result };
+      }
+    } else if (params.value !== undefined) {
+      const result = await mcpZoom(params.value > 0 ? 'in' : 'out', Math.abs(params.value));
+      return { success: true, result };
+    }
+    return { success: false, error: '缩放参数无效' };
+  } catch (error) {
+    console.error('执行缩放命令时出错:', error);
+    return { success: false, error: error.message };
+  }
+};
+
+/**
+ * 执行聚焦命令
+ * @param {Object} params - 聚焦参数
+ * @returns {Promise<Object>} - 执行结果
+ */
+const executeFocus = async (params) => {
+  try {
+    if (params.targetId) {
+      const result = await mcpFocus(params.targetId);
+      return { success: true, result, targetId: params.targetId };
+    } else if (params.position) {
+      // 处理自定义位置聚焦
+      const result = await mcpFocus(null, params.position);
+      return { success: true, result, position: params.position };
+    }
+    return { success: false, error: '聚焦参数无效' };
+  } catch (error) {
+    console.error('执行聚焦命令时出错:', error);
+    return { success: false, error: error.message };
+  }
+};
+
+/**
+ * 执行重置命令
+ * @param {Object} params - 重置参数
+ * @returns {Promise<Object>} - 执行结果
+ */
+const executeReset = async (params) => {
+  try {
+    const result = await mcpReset();
+    return { success: true, result };
+  } catch (error) {
+    console.error('执行重置命令时出错:', error);
+    return { success: false, error: error.message };
+  }
+};
+
+/**
+ * 生成命令ID
+ * @param {string} operation - 操作类型
+ * @returns {string} - 命令ID
+ */
+const generateCommandId = (operation) => {
+  return commandStateManager.registerCommand(operation);
+};
+
+// 执行本地命令
+const executeLocalCommand = async (command) => {
+  try {
+    // 根据操作类型执行相应的本地操作
+    if (command.operation === 'zoom') {
+      const scale = command.params.scale || 1.0;
+      return executeLocalZoom(scale);
+    } else if (command.operation === 'rotate') {
+      // 修复旋转命令参数解析
+      const direction = command.params.direction || 'left';
+      const angle = command.params.angle || 45;
+      return executeLocalRotate({ direction, angle });
+    } else if (command.operation === 'focus') {
+      const target = command.params.target || command.params.objectName;
+      return executeLocalFocus(target);
+    } else if (command.operation === 'reset') {
+      return executeLocalReset();
+    } else {
+      console.warn(`未知的操作类型: ${command.operation}`);
+      return false;
+    }
+  } catch (error) {
+    console.error(`执行本地命令出错`);
+    return false;
   }
 };
 
@@ -1306,7 +1421,10 @@ onMounted(async () => {
   }
   window.app.rotateModel = rotateModel;
   window.app.zoomModel = zoomModel;
-  window.app.focusModel = window.focusModel;
+  window.app.focusModel = params => {
+    console.log('app.focusModel被调用:', params);
+    return executeLocalFocus(params);
+  };
   window.app.resetModel = window.resetModel;
 
   console.log('已将模型操作方法挂载到window和window.app对象');
@@ -1351,6 +1469,15 @@ const rotateModel = async (params) => {
   try {
     console.log('执行旋转命令:', params);
 
+    // 检查是否近期已执行过相似命令
+    if (commandStateManager.isCommandExecuted('rotate', params)) {
+      console.log(`近期已执行过相似的rotate命令，跳过执行`);
+      return true; // 返回成功，因为操作效果已经实现
+    }
+
+    // 注册新命令
+    const commandKey = commandStateManager.registerCommand('rotate', params);
+
     // 检查THREE.js对象是否已初始化
     if (!scene || !camera || !renderer || !controls) {
       console.error('THREE.js对象未完全初始化');
@@ -1366,7 +1493,11 @@ const rotateModel = async (params) => {
       } catch (connError) {
         console.error('重新连接命令WebSocket失败:', connError);
         console.warn('降级到本地旋转实现');
-        return executeLocalRotate(params);
+        const result = executeLocalRotate(params);
+        if (result) {
+          commandStateManager.markAsExecuted(commandKey);
+        }
+        return result;
       }
     }
 
@@ -1387,11 +1518,24 @@ const rotateModel = async (params) => {
     try {
       const result = await wsManager.sendCommand('/ws/command', command);
       console.log('MCP服务器旋转命令执行结果:', result);
+      
+      // 执行本地操作保持视觉一致性
+      const localResult = executeLocalRotate(params);
+      
+      // 标记命令为已执行
+      if (result?.success || result?.status === 'success' || localResult) {
+        commandStateManager.markAsExecuted(commandKey);
+      }
+      
       return result?.success || result?.status === 'success' || true;
     } catch (wsError) {
       console.error('与MCP服务器通信失败:', wsError);
       console.warn('降级到本地旋转实现');
-      return executeLocalRotate(params);
+      const result = executeLocalRotate(params);
+      if (result) {
+        commandStateManager.markAsExecuted(commandKey);
+      }
+      return result;
     }
   } catch (error) {
     console.error('旋转命令执行失败:', error);
@@ -1401,64 +1545,81 @@ const rotateModel = async (params) => {
   }
 };
 
-// 提取本地旋转实现为单独函数
+// 执行本地旋转操作
 const executeLocalRotate = (params) => {
   try {
-    console.log('使用本地旋转实现', params);
-    if (controls) {
-      const angle = params.angle || 45;
-      const radians = angle * Math.PI / 180; // 转换为弧度
-
-      // 直接使用controls对象进行旋转
-      if (params.direction === 'left') {
-        controls.rotateLeft(radians);
-        controls.update();
-        renderer.render(scene, camera);
-        console.log('向左旋转完成', angle, '度');
-        return true;
+    // 获取参数
+    let direction = params.direction || 'left';
+    let angle = params.angle;
+    
+    // 优先使用参数中的值
+    if (!angle) {
+      if (window.currentRotationParams) {
+        angle = window.currentRotationParams.angle || 45;
+      } else if (sessionStorage.getItem('requested_angle')) {
+        angle = parseInt(sessionStorage.getItem('requested_angle'));
+      } else {
+        angle = 45;
       }
-      else if (params.direction === 'right') {
-        controls.rotateRight(radians);
-        controls.update();
-        renderer.render(scene, camera);
-        console.log('向右旋转完成', angle, '度');
-        return true;
-      }
-      else if (params.direction === 'up') {
-        controls.rotateUp(radians);
-        controls.update();
-        renderer.render(scene, camera);
-        console.log('向上旋转完成', angle, '度');
-        return true;
-      }
-      else if (params.direction === 'down') {
-        controls.rotateDown(radians);
-        controls.update();
-        renderer.render(scene, camera);
-        console.log('向下旋转完成', angle, '度');
-        return true;
-      }
-      else {
-        // 默认为左旋转
-        console.log('未知方向，默认向左旋转', angle, '度');
-        controls.rotateLeft(radians);
-        controls.update();
-        renderer.render(scene, camera);
-        return true;
-      }
-    } else {
-      console.error('controls对象不存在，无法执行旋转操作');
     }
-  } catch (fallbackError) {
-    console.error('本地旋转实现错误:', fallbackError);
+    
+    // 确保角度是数值
+    angle = parseFloat(angle);
+    
+    // 确保THREE.js对象初始化
+    if (!scene || !camera || !renderer || !controls) {
+      console.error('THREE.js对象未初始化，无法执行旋转');
+      return false;
+    }
+    
+    // 向左旋转是正角度，向右旋转是负角度
+    const rotationAngle = direction === 'left' ? angle * (Math.PI / 180) : -angle * (Math.PI / 180);
+    
+    // 记录原始位置
+    const originalPosition = camera.position.clone();
+    
+    // 围绕场景中心旋转相机
+    const centerPoint = new THREE.Vector3(0, 0, 0);
+    const axis = new THREE.Vector3(0, 1, 0); // Y轴旋转
+    
+    // 创建旋转矩阵
+    const rotationMatrix = new THREE.Matrix4().makeRotationAxis(axis, rotationAngle);
+    
+    // 应用旋转
+    camera.position.sub(centerPoint); // 相对于中心点
+    camera.position.applyMatrix4(rotationMatrix); // 应用旋转
+    camera.position.add(centerPoint); // 移回原位
+    
+    // 更新相机朝向
+    camera.lookAt(centerPoint);
+    
+    // 更新控制器
+    controls.target.copy(centerPoint);
+    controls.update();
+    
+    // 渲染场景
+    renderer.render(scene, camera);
+    
+    return true;
+  } catch (error) {
+    console.error('执行本地旋转操作时出错');
+    return false;
   }
-  return false;
 };
 
 // 修改zoomModel函数,使用MCP命令
 const zoomModel = async (params) => {
   try {
     console.log('执行缩放命令:', params);
+
+    // 检查是否近期已执行过相似命令
+    if (commandStateManager.isCommandExecuted('zoom', params)) {
+      console.log(`近期已执行过相似的zoom命令，跳过执行`);
+      return true; // 返回成功，因为操作效果已经实现
+    }
+
+    // 注册新命令
+    const commandKey = commandStateManager.registerCommand('zoom', params);
 
     // 检查THREE.js对象是否已初始化
     if (!scene || !camera || !renderer || !controls) {
@@ -1475,7 +1636,11 @@ const zoomModel = async (params) => {
       } catch (connError) {
         console.error('重新连接命令WebSocket失败:', connError);
         console.warn('降级到本地缩放实现');
-        return executeLocalZoom(params);
+        const result = executeLocalZoom(params);
+        if (result) {
+          commandStateManager.markAsExecuted(commandKey);
+        }
+        return result;
       }
     }
 
@@ -1495,11 +1660,24 @@ const zoomModel = async (params) => {
     try {
       const result = await wsManager.sendCommand('/ws/command', command);
       console.log('MCP服务器缩放命令执行结果:', result);
+      
+      // 执行本地操作保持视觉一致性
+      const localResult = executeLocalZoom(params);
+      
+      // 标记命令为已执行
+      if (result?.success || result?.status === 'success' || localResult) {
+        commandStateManager.markAsExecuted(commandKey);
+      }
+      
       return result?.success || result?.status === 'success' || true;
     } catch (wsError) {
       console.error('与MCP服务器通信失败:', wsError);
       console.warn('降级到本地缩放实现');
-      return executeLocalZoom(params);
+      const result = executeLocalZoom(params);
+      if (result) {
+        commandStateManager.markAsExecuted(commandKey);
+      }
+      return result;
     }
   } catch (error) {
     console.error('缩放命令执行失败:', error);
@@ -1618,6 +1796,15 @@ const focusOnModel = async (params) => {
   try {
     console.log('执行聚焦命令:', params);
 
+    // 检查是否近期已执行过相似命令
+    if (commandStateManager.isCommandExecuted('focus', params)) {
+      console.log(`近期已执行过相似的focus命令，跳过执行`);
+      return true; // 返回成功，因为操作效果已经实现
+    }
+
+    // 注册新命令
+    const commandKey = commandStateManager.registerCommand('focus', params);
+
     // 检查THREE.js对象是否已初始化
     if (!scene || !camera || !renderer || !controls) {
       console.error('THREE.js对象未完全初始化');
@@ -1626,38 +1813,60 @@ const focusOnModel = async (params) => {
 
     // 检查WebSocket连接是否活跃
     if (!wsManager.isConnectionActive('/ws/command')) {
-      console.error('命令WebSocket连接未就绪，尝试重新连接');
+      console.warn('命令WebSocket连接未就绪，尝试重新连接');
       try {
         await wsManager.connect('/ws/command');
         console.log('已重新连接到命令WebSocket');
       } catch (connError) {
         console.error('重新连接命令WebSocket失败:', connError);
-        // 失败后使用本地聚焦实现
-        return executeLocalFocus(params);
+        console.warn('降级到本地聚焦实现');
+        const result = executeLocalFocus(params);
+        if (result) {
+          commandStateManager.markAsExecuted(commandKey);
+        }
+        return result;
       }
     }
 
-    // 创建并发送聚焦命令
+    // 创建并发送聚焦命令 - 确保使用MCP标准格式
     const command = {
       type: 'mcp.command',
-      action: 'focus',
+      operation: 'focus',
       parameters: {
-        target: params.target || 'center'
+        target: params.target || params.objectName || 'center'
       },
       id: `cmd_${Date.now()}_${Math.floor(Math.random() * 10000)}`,
       timestamp: new Date().toISOString()
     };
 
-    console.log('发送MCP聚焦命令:', command);
+    console.log('发送MCP聚焦命令到服务器:', command);
 
-    const result = await wsManager.sendCommand('/ws/command', command);
-    console.log('聚焦命令执行结果:', result);
-
-    return result?.success || result?.status === 'success' || true;
+    try {
+      const result = await wsManager.sendCommand('/ws/command', command);
+      console.log('MCP服务器聚焦命令执行结果:', result);
+      
+      // 执行本地操作保持视觉一致性
+      const localResult = executeLocalFocus(params);
+      
+      // 标记命令为已执行
+      if (result?.success || result?.status === 'success' || localResult) {
+        commandStateManager.markAsExecuted(commandKey);
+      }
+      
+      return result?.success || result?.status === 'success' || true;
+    } catch (wsError) {
+      console.error('与MCP服务器通信失败:', wsError);
+      console.warn('降级到本地聚焦实现');
+      const result = executeLocalFocus(params);
+      if (result) {
+        commandStateManager.markAsExecuted(commandKey);
+      }
+      return result;
+    }
   } catch (error) {
     console.error('聚焦命令执行失败:', error);
-
     // 出错时尝试使用本地实现
+    console.warn('降级到本地聚焦实现');
     return executeLocalFocus(params);
   }
 };
@@ -1785,162 +1994,135 @@ window.app.toggleAnimation = window.toggleAnimation;
 
 console.log('模型操作方法已暴露到全局对象');
 
-// 暴露MCP相关方法
+// 注意：此处之前有重复defineExpose，已移除。最终的defineExpose在文件底部
+
+// 本地执行重置操作
+const executeLocalReset = async () => {
+  console.log('本地执行重置模型视图操作');
+  try {
+    // 重置相机位置
+    if (camera) {
+      camera.position.set(0, 5, 10);
+      camera.lookAt(0, 0, 0);
+    }
+    
+    // 重置控制器
+    if (controls) {
+      controls.reset();
+      controls.update();
+    }
+    
+    // 重置模型位置和旋转
+    if (scene && model) {
+      model.position.set(0, 0, 0);
+      model.rotation.set(0, 0, 0);
+      scene.updateMatrixWorld(true);
+    }
+    
+    // 渲染一帧
+    if (renderer && scene && camera) {
+      renderer.render(scene, camera);
+    }
+    
+    console.log('模型视图已重置');
+    return true;
+  } catch (error) {
+    console.error('执行重置操作失败:', error);
+    return false;
+  }
+};
+
+// 处理并发CommandQueue的锁
+// let lastExecutedCommandTimestamp = null; // 这行已在上方定义，移除重复声明
+
+// 接收WebSocket消息处理
+const handleWebSocketMessage = (message) => {
+  try {
+    // 解析消息
+    const { operation, params, id } = message;
+    console.log('收到WebSocket命令:', operation, params, id);
+
+    // 确定操作类型和参数
+    const operationType = operation || 'unknown';
+    const commandParams = params || {};
+    const commandId = id || generateCommandId(operationType);
+
+    // 检查是否为已执行过的相似命令
+    if (commandStateManager.isCommandExecuted(operationType, commandParams)) {
+      console.log(`跳过相似命令: ${operationType}`, commandParams);
+      return;
+    }
+
+    // 优先级检查：如果队列中存在相同类型的命令，且当前命令是focus或reset，则替换队列中的命令
+    if (operationType === 'focus' || operationType === 'reset') {
+      const index = commandQueue.value.findIndex(cmd => cmd.operation === operationType);
+      if (index !== -1) {
+        console.log(`替换队列中的${operationType}命令`);
+        commandQueue.value.splice(index, 1);
+      }
+    }
+
+    // 防止重复命令：检查队列中是否已存在相似命令
+    const hasSimilarCommand = commandQueue.value.some(cmd => {
+      return cmd.operation === operationType && 
+             commandStateManager.areParamsSimilar(cmd.params, commandParams, operationType);
+    });
+
+    if (hasSimilarCommand) {
+      console.log(`队列中已存在相似命令: ${operationType}`);
+      return;
+    }
+
+    // 将命令添加到队列
+    commandQueue.value.push({
+      id: commandId,
+      operation: operationType,
+      params: commandParams,
+      timestamp: Date.now()
+    });
+
+    // 如果当前没有正在执行的命令，启动队列处理
+    if (!isExecutingCommands.value) {
+      // 使用nextTick确保Vue更新队列后再执行命令
+      nextTick(() => executeQueuedCommands());
+    } else {
+      console.log('命令已添加到队列，等待执行');
+    }
+  } catch (error) {
+    console.error('处理WebSocket消息时出错:', error);
+  }
+};
+
+// 暴露方法给Parent Component
 defineExpose({
-  zoomComponent,
+  // 命令队列相关
+  commandQueue,
+  isExecutingCommands,
+  executeQueuedCommands,
+  
+  // 组件方法
   rotateComponent,
+  zoomComponent,
   focusOnComponent,
   resetModel,
+  
+  // MCP方法
   mcpRotate,
   mcpZoom,
   mcpFocus,
   mcpReset,
   mcpStatus,
   mcpConnected,
-  executeQueuedCommands
+  
+  // 直接操作方法
+  rotateModel,
+  zoomModel,
+  focusOnModel,
+  executeLocalRotate,
+  executeLocalZoom,
+  executeLocalFocus,
+  executeLocalReset,
 });
-
-// 接收WebSocket消息处理
-const handleWebSocketMessage = (data) => {
-  console.log('收到WebSocket消息:', data);
-
-  try {
-    // 处理MCP命令响应
-    if (data.type === 'mcp.response' && data.command_id) {
-      // 查找对应的命令ID
-      console.log('收到命令响应:', data);
-
-      if (data.status === 'success') {
-        // 操作成功，执行本地处理
-        if (data.action === 'zoom' || data.operation === 'zoom') {
-          // 提取缩放参数
-          let scale = null;
-
-          // 尝试从不同位置提取scale参数
-          if (data.result && data.result.data && data.result.data.scale) {
-            scale = data.result.data.scale;
-          } else if (data.parameters && data.parameters.scale) {
-            scale = data.parameters.scale;
-          } else if (data.params && data.params.scale) {
-            scale = data.params.scale;
-          }
-
-          // 如果找到了scale参数，执行本地缩放
-          if (scale !== null) {
-            console.log(`服务器命令成功，执行本地缩放: scale=${scale}`);
-            executeLocalZoom({ scale });
-          }
-        } else if (data.action === 'rotate' || data.operation === 'rotate') {
-          // 提取旋转参数
-          let direction = null;
-          let angle = null;
-
-          // 尝试从不同位置提取旋转参数
-          if (data.result && data.result.data) {
-            direction = data.result.data.direction;
-            angle = data.result.data.angle;
-          } else if (data.parameters) {
-            direction = data.parameters.direction;
-            angle = data.parameters.angle;
-          } else if (data.params) {
-            direction = data.params.direction;
-            angle = data.params.angle;
-          }
-
-          // 如果找到了旋转参数，执行本地旋转
-          if (direction && angle) {
-            console.log(`服务器命令成功，执行本地旋转: direction=${direction}, angle=${angle}`);
-            executeLocalRotate({ direction, angle });
-          }
-        } else if (data.action === 'reset' || data.operation === 'reset') {
-          // 执行本地重置
-          console.log('服务器命令成功，执行本地重置');
-          executeResetModel();
-        } else if (data.action === 'focus' || data.operation === 'focus') {
-          // 提取聚焦参数
-          let target = null;
-
-          // 尝试从不同位置提取target参数
-          if (data.result && data.result.data && data.result.data.target) {
-            target = data.result.data.target;
-          } else if (data.parameters && data.parameters.target) {
-            target = data.parameters.target;
-          } else if (data.params && data.params.target) {
-            target = data.params.target;
-          }
-
-          // 如果找到了target参数，执行本地聚焦
-          if (target) {
-            console.log(`服务器命令成功，执行本地聚焦: target=${target}`);
-            executeLocalFocus({ target });
-          }
-        }
-      }
-    }
-
-    // 继续处理MCP命令（原有逻辑）
-    if (data.type === 'mcp.command') {
-      const operation = data.operation || data.action;
-      const params = data.params || data.parameters || {};
-
-      console.log(`接收到WebSocket MCP命令: ${operation}`, params);
-
-      // 检查并修正角度参数
-      if (operation === 'rotate') {
-        // 获取前端保存的用户请求的角度
-        const requestedAngle = sessionStorage.getItem('requested_angle');
-        const requestedDirection = sessionStorage.getItem('requested_direction');
-
-        if (requestedAngle) {
-          const userAngle = parseInt(requestedAngle);
-
-          // 如果用户请求的角度与WebSocket发来的不同，则修正
-          if (userAngle !== params.angle) {
-            console.log(`修正WebSocket旋转角度: 从${params.angle}°改为${userAngle}°`);
-            params.angle = userAngle;
-          }
-        }
-
-        // 如果有保存方向且与WebSocket发来的不同，也修正
-        if (requestedDirection && requestedDirection !== params.direction) {
-          console.log(`修正WebSocket旋转方向: 从${params.direction}改为${requestedDirection}`);
-          params.direction = requestedDirection;
-        }
-      }
-
-      // 防止重复添加相同命令
-      const command = {
-        operation,
-        params,
-        id: data.id || `cmd_${Date.now()}_${Math.floor(Math.random() * 10000)}`,
-        timestamp: new Date().toISOString(),
-        source: 'websocket'
-      };
-
-      // 检查是否已存在相同命令
-      const isDuplicate = commandQueue.value.some(cmd =>
-          cmd.operation === command.operation &&
-          JSON.stringify(cmd.params) === JSON.stringify(command.params)
-      );
-
-      // 不重复添加相同命令
-      if (!isDuplicate) {
-        // 将命令加入队列
-        commandQueue.value.push(command);
-        console.log(`命令已加入队列，当前队列长度: ${commandQueue.value.length}`, commandQueue.value);
-
-        // 触发命令队列已更新事件
-        if (window && window.dispatchEvent) {
-          window.dispatchEvent(new CustomEvent('mcp-command-queued', { detail: command }));
-        }
-      } else {
-        console.log('跳过重复命令:', command);
-      }
-    }
-  } catch (error) {
-    console.error('处理WebSocket消息失败:', error);
-  }
-};
 </script>
 
 <style scoped>

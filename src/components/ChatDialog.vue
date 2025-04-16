@@ -1,6 +1,13 @@
 <script setup lang="ts">
 import { ref, reactive, onMounted, nextTick, computed, watch, onBeforeUnmount } from 'vue';
 import { getMCPClient } from '../utils/MCPClient';
+import CommandStateManager from '../utils/CommandStateManager';
+
+// 创建命令状态管理器实例
+const commandStateManager = new CommandStateManager({
+  commandTTL: 5000,  // 5秒内的相似命令视为重复
+  lockTimeout: 8000  // 命令锁8秒超时
+});
 
 // 定义props (Define props)
 const props = defineProps<{
@@ -60,108 +67,164 @@ const closeDialog = () => {
 // 添加延迟函数
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-// 发送消息 (Send message)
+// 发送消息并处理AI响应
 const sendMessage = async () => {
-  // 检查消息是否为空
-  if (!userMessage.value.trim()) {
-    console.warn('消息内容为空，取消发送');
-    return;
-  }
+  if (!userMessage.value.trim()) return;
   
-  if (isLoading.value) {
-    console.warn('正在处理上一条消息，请稍后重试');
-    return;
-  }
-  
-  const message = userMessage.value.trim();
+  // 清除输入框并添加用户消息到历史记录
+  const userMessageText = userMessage.value.trim();
   userMessage.value = '';
-  isLoading.value = true;
   
-  // 添加用户消息到历史记录 (Add user message to history)
   chatHistory.push({
     role: 'user',
-    content: message,
+    content: userMessageText,
     time: formatTime(new Date())
   });
   
-  // 滚动到底部 (Scroll to bottom)
+  // 滚动到底部
   await nextTick();
   scrollToBottom();
   
+  // 设置加载状态
+  isLoading.value = true;
+  
   try {
-    // 创建一个操作ID，用于标识当前操作
-    const operationId = `op_${Date.now()}`;
+    // 设置正在处理标记
+    window.isProcessingAICommand = true;
     
-    // 先快速检测是否包含操作指令 (预检测)
-    const detectedOperation = detectOperation(message);
+    // 检测是否有操作指令(备用)
+    const detectedOperation = detectOperation(userMessageText);
     
-    // 如果预检测到操作类型，仅记录到会话存储中，但不立即执行
+    // 如果检测到操作指令，先注册但不立即执行
+    let pendingCommandKey = null;
     if (detectedOperation) {
-      console.log('预检测到操作指令:', detectedOperation.operation);
-      // 仅记录操作类型，不执行操作
-      sessionStorage.setItem(`last_mcp_operation_type`, detectedOperation.operation);
-      sessionStorage.setItem(`last_mcp_operation_time`, Date.now().toString());
+      pendingCommandKey = commandStateManager.registerCommand(
+        detectedOperation.operation, 
+        detectedOperation.parameters
+      );
+      sessionStorage.setItem('pending_command_key', pendingCommandKey);
+      
+      // 记录操作类型到会话存储，防止重复执行
+      sessionStorage.setItem('last_mcp_operation_type', detectedOperation.operation);
+      sessionStorage.setItem('last_mcp_operation_time', Date.now().toString());
+      console.log(`已注册操作指令: ${detectedOperation.operation}，等待AI响应后执行`);
     }
     
-    // 发送消息到AI服务（Dify/SpringBoot），此服务应该能够分析是否包含操作指令
-    const aiResponse = await sendToDifyServer(message);
+    // 发送消息到AI服务
+    const aiResponse = await sendToDifyServer(userMessageText);
     
-    // 处理AI响应
+    // 添加AI回复到历史记录
     if (aiResponse && aiResponse.success) {
-      // 添加AI回复到历史记录
       chatHistory.push({
         role: 'assistant',
         content: aiResponse.text,
-        time: formatTime(new Date()),
-        mcpOperation: aiResponse.operation ? {
-          operation: aiResponse.operation,
-          parameters: aiResponse.parameters || {},
-          success: true
-        } : undefined
+        time: formatTime(new Date())
       });
       
-      // 确保UI更新，AI回复显示出来
-      await nextTick();
-      scrollToBottom();
-      
-      // 延迟执行操作，确保AI回复先显示
-      // 增加到1000ms延迟，确保UI完全渲染并且用户能看到AI回复
-      console.log('延迟执行模型操作，等待AI回复显示...');
-      await delay(1000);
-      
-      // 如果AI服务检测到操作指令并返回了action或operation
-      if (aiResponse.action || aiResponse.operation) {
-        // 优先使用返回的action对象
-        const actionObj = aiResponse.action || { 
-          type: aiResponse.operation,
-          params: aiResponse.parameters || {}
-        };
-        
-        // 尝试检查角度参数
-        if ((actionObj.type === 'rotate' || actionObj.operation === 'rotate') && 
-            sessionStorage.getItem('requested_angle')) {
-          const requestedAngle = parseInt(sessionStorage.getItem('requested_angle'));
-          const currentAngle = actionObj.params?.angle || actionObj.parameters?.angle;
+      // 检查是否有操作指令
+      if (aiResponse.operation || aiResponse.action) {
+        try {
+          // 延迟执行模型操作，等待AI回复显示
+          console.log('延迟执行模型操作，等待AI回复显示...');
+          await delay(1000);
           
-          if (currentAngle && currentAngle !== requestedAngle) {
-            console.log(`修正旋转角度: 从${currentAngle}°改为${requestedAngle}°`);
-            
-            // 修正角度参数
-            if (actionObj.params) {
+          // 标准化操作对象
+          const actionObj = {
+            type: aiResponse.operation || (aiResponse.action && aiResponse.action.type),
+            params: aiResponse.parameters || aiResponse.action?.params || {}
+          };
+          
+          // 尝试检查角度参数
+          if (actionObj.type === 'rotate' && sessionStorage.getItem('requested_angle')) {
+            const requestedAngle = parseInt(sessionStorage.getItem('requested_angle') || '45');
+            if (actionObj.params.angle && actionObj.params.angle !== requestedAngle) {
+              console.log(`修正旋转角度: 从${actionObj.params.angle}°改为${requestedAngle}°`);
               actionObj.params.angle = requestedAngle;
-            } else if (actionObj.parameters) {
-              actionObj.parameters.angle = requestedAngle;
             }
           }
+          
+          // 确保zoom操作的参数正确
+          if (actionObj.type === 'zoom') {
+            // 确保有缩放参数，没有就使用默认值1.5
+            if (!actionObj.params.scale && !actionObj.params.scaleOrFactor) {
+              actionObj.params.scale = 1.5;
+            }
+            // 使用可能存在的其他名称的缩放参数
+            else if (!actionObj.params.scale && actionObj.params.scaleOrFactor) {
+              actionObj.params.scale = actionObj.params.scaleOrFactor;
+            }
+            // 确保缩放参数是浮点数
+            actionObj.params.scale = parseFloat(actionObj.params.scale);
+            console.log(`缩放操作参数已标准化: scale=${actionObj.params.scale}`);
+          }
+          
+          // 确保focus操作的参数正确
+          if (actionObj.type === 'focus' && !actionObj.params.target) {
+            actionObj.params.target = actionObj.params.objectName || 'center';
+          }
+          
+          // 检查是否近期已执行过相似命令
+          if (commandStateManager.isCommandExecuted(actionObj.type, actionObj.params)) {
+            console.log(`近期已执行过相似的${actionObj.type}命令，跳过执行`);
+          } else {
+            // 尝试获取执行锁
+            if (commandStateManager.acquireLock()) {
+              try {
+                console.log('现在执行模型操作:', actionObj);
+                
+                // 记录操作到会话存储中，确保后续可以使用
+                if (actionObj.type) {
+                  sessionStorage.setItem('last_mcp_operation_type', actionObj.type);
+                  if (actionObj.type === 'zoom' && actionObj.params.scale) {
+                    sessionStorage.setItem('requested_scale', actionObj.params.scale.toString());
+                  } else if (actionObj.type === 'rotate') {
+                    if (actionObj.params.angle) {
+                      sessionStorage.setItem('requested_angle', actionObj.params.angle.toString());
+                    }
+                    if (actionObj.params.direction) {
+                      sessionStorage.setItem('requested_direction', actionObj.params.direction);
+                    }
+                  } else if (actionObj.type === 'focus' && actionObj.params.target) {
+                    sessionStorage.setItem('requested_target', actionObj.params.target);
+                  }
+                }
+                
+                // 发送命令到父组件执行
+                emit('executeAction', actionObj);
+                
+                // 如果有pending命令，标记为已执行
+                if (pendingCommandKey) {
+                  commandStateManager.markAsExecuted(pendingCommandKey);
+                } else {
+                  // 注册并标记新命令为已执行
+                  const newCommandKey = commandStateManager.registerCommand(
+                    actionObj.type, 
+                    actionObj.params
+                  );
+                  commandStateManager.markAsExecuted(newCommandKey);
+                }
+                
+                // 确保命令已发出后才执行队列命令 - 增加延迟时间
+                await delay(500);
+              } finally {
+                // 释放执行锁
+                commandStateManager.releaseLock();
+              }
+            } else {
+              console.log('无法获取命令执行锁，跳过执行');
+            }
+          }
+          
+          // 移除正在处理标记
+          window.isProcessingAICommand = false;
+        } catch (operationError) {
+          console.error('执行操作失败:', operationError);
+          window.isProcessingAICommand = false;
         }
-        
-        // 延迟后发出操作事件 - 确保AI回复显示后再执行操作
-        console.log('现在执行模型操作:', actionObj);
-        emit('executeAction', actionObj);
+      } else {
+        // 如果没有操作指令，移除正在处理标记
+        window.isProcessingAICommand = false;
       }
-      
-      // 执行队列中的命令
-      executeQueuedCommands();
     } else {
       // 处理失败情况
       chatHistory.push({
@@ -170,46 +233,434 @@ const sendMessage = async () => {
         time: formatTime(new Date()),
         error: true
       });
+      
+      // 移除正在处理标记
+      window.isProcessingAICommand = false;
     }
   } catch (error) {
     console.error('请求错误:', error);
-    // 添加错误消息到历史记录 (Add error message to history)
+    // 添加错误消息到历史记录
     chatHistory.push({
       role: 'assistant',
       content: `抱歉，发生了错误: ${(error as Error).message}`,
       time: formatTime(new Date()),
       error: true
     });
+    
+    // 移除正在处理标记
+    window.isProcessingAICommand = false;
   } finally {
     isLoading.value = false;
     
-    // 滚动到底部 (Scroll to bottom)
+    // 滚动到底部
     await nextTick();
     scrollToBottom();
   }
 };
 
-// 执行队列中的命令
+// 执行队列中的命令 - 减少直接调用
 const executeQueuedCommands = () => {
-  // 获取父组件传来的模型查看器引用
-  const parentElement = document.querySelector('.chat-dialog')?.parentElement;
-  if (!parentElement) {
-    console.warn('无法找到父元素，无法执行队列命令');
+  // 检查是否有最近执行的命令
+  const lastOpType = sessionStorage.getItem('last_mcp_operation_type');
+  const lastOpTime = sessionStorage.getItem('last_mcp_operation_time');
+  
+  if (lastOpType && lastOpTime) {
+    // 检查命令执行时间是否过近(5秒内)
+    const now = Date.now();
+    const lastTime = parseInt(lastOpTime);
+    if (now - lastTime < 5000) {
+      console.log(`命令${lastOpType}在5秒内已执行过，跳过重复执行`);
+      return;
+    }
+  }
+  
+  // 获取模型查看器引用
+  const modelViewer = findModelViewerReference();
+  
+  if (!modelViewer) {
+    console.warn('无法找到模型查看器引用，尝试通过全局事件执行命令');
+    
+    // 尝试通过事件触发执行队列命令
+    window.dispatchEvent(new CustomEvent('execute-queued-commands'));
+    
+    // 尝试直接调用全局对象上的方法
+    if (window.app && typeof window.app.executeQueuedCommands === 'function') {
+      console.log('使用全局app对象执行队列命令');
+      window.app.executeQueuedCommands();
+      return;
+    }
+    
+    // 尝试使用直接的全局方法 - 这里不获取锁，因为tryDirectGlobalMethod内部会获取锁
+    if (lastOpType) {
+      console.log('尝试使用全局方法执行最后的操作:', lastOpType);
+      tryDirectGlobalMethod(lastOpType);
+    }
+    
     return;
   }
   
-  // 尝试获取模型查看器组件
-  const modelViewer = parentElement.__vue__?.refs?.modelViewer || 
-                       parentElement.__vue__?.setupState?.modelViewerRef?.value;
+  console.log('找到模型查看器引用:', modelViewer);
   
-  if (modelViewer && typeof modelViewer.executeQueuedCommands === 'function') {
-    console.log('调用modelViewer.executeQueuedCommands执行队列命令');
-    modelViewer.executeQueuedCommands();
+  // 检查是否有命令队列和执行方法
+  if (modelViewer.commandQueue && typeof modelViewer.executeQueuedCommands === 'function') {
+    console.log('调用ModelViewer.executeQueuedCommands执行队列命令');
+    
+    // 先检查MCP服务器状态
+    checkMCPServerStatus().then(isAvailable => {
+      if (!isAvailable) {
+        console.warn('MCP服务器不可用，命令执行可能失败');
+      }
+      
+      // 尝试获取命令执行锁
+      if (commandStateManager.acquireLock()) {
+        try {
+          // 无论MCP状态如何，都尝试执行命令
+          try {
+            modelViewer.executeQueuedCommands();
+          } catch (error) {
+            console.error('执行队列命令失败:', error);
+            
+            // 如果执行失败，尝试直接执行具体操作
+            tryExecuteDirectOperations(modelViewer);
+          }
+        } finally {
+          // 确保释放锁
+          commandStateManager.releaseLock();
+        }
+      } else {
+        console.log('无法获取命令执行锁，跳过执行队列命令');
+      }
+    });
+  } else if (modelViewer.rotateComponent || modelViewer.zoomComponent || 
+             modelViewer.rotateModel || modelViewer.zoomModel) {
+    console.log('模型查看器不支持命令队列，但支持直接操作方法');
+    // 尝试获取锁执行直接操作
+    if (commandStateManager.acquireLock()) {
+      try {
+        tryExecuteDirectOperations(modelViewer);
+      } finally {
+        commandStateManager.releaseLock();
+      }
+    }
   } else {
-    // 尝试通过事件触发执行队列命令
-    console.log('通过事件触发执行队列命令');
-    window.dispatchEvent(new CustomEvent('execute-queued-commands'));
+    console.error('模型查看器不支持命令队列或操作方法');
+    // 尝试使用全局方法 - 这里不获取锁，因为tryDirectGlobalMethod内部会获取锁
+    if (lastOpType) {
+      console.log('尝试使用全局方法执行最后的操作:', lastOpType);
+      tryDirectGlobalMethod(lastOpType);
+    }
   }
+};
+
+// 尝试直接使用全局方法执行操作
+const tryDirectGlobalMethod = (opType) => {
+  // 检查是否近期已执行过相似命令
+  let params = {};
+  
+  switch(opType.toLowerCase()) {
+    case 'zoom':
+      params = { scale: parseFloat(sessionStorage.getItem('requested_scale') || '1.5') };
+      break;
+    case 'rotate':
+      params = {
+        angle: parseInt(sessionStorage.getItem('requested_angle') || '45'),
+        direction: sessionStorage.getItem('requested_direction') || 'left'
+      };
+      break;
+    case 'focus':
+      params = { target: sessionStorage.getItem('requested_target') || 'center' };
+      break;
+  }
+  
+  if (commandStateManager.isCommandExecuted(opType, params)) {
+    console.log(`近期已执行过相似的${opType}命令，跳过执行`);
+    return false;
+  }
+  
+  // 尝试获取执行锁
+  if (!commandStateManager.acquireLock()) {
+    console.log('无法获取命令执行锁，跳过全局方法执行');
+    return false;
+  }
+  
+  let executed = false;
+  
+  try {
+    // 注册新命令
+    const commandKey = commandStateManager.registerCommand(opType, params);
+    
+    switch(opType.toLowerCase()) {
+      case 'zoom':
+        if (typeof window.zoomModel === 'function') {
+          const scale = parseFloat(sessionStorage.getItem('requested_scale') || '1.5');
+          console.log(`使用全局zoomModel方法：比例=${scale}`);
+          window.zoomModel({ scale });
+          executed = true;
+        }
+        break;
+      case 'rotate':
+        if (typeof window.rotateModel === 'function') {
+          const angle = parseInt(sessionStorage.getItem('requested_angle') || '45');
+          const direction = sessionStorage.getItem('requested_direction') || 'left';
+          console.log(`使用全局rotateModel方法：角度=${angle}, 方向=${direction}`);
+          window.rotateModel({ direction, angle });
+          executed = true;
+        }
+        break;
+      case 'focus':
+        if (typeof window.focusModel === 'function') {
+          const target = sessionStorage.getItem('requested_target') || 'center';
+          console.log(`使用全局focusModel方法：目标=${target}`);
+          window.focusModel({ target });
+          executed = true;
+        }
+        break;
+      case 'reset':
+        if (typeof window.resetModel === 'function') {
+          console.log('使用全局resetModel方法');
+          window.resetModel();
+          executed = true;
+        }
+        break;
+    }
+    
+    // 如果执行成功，标记命令为已执行
+    if (executed) {
+      commandStateManager.markAsExecuted(commandKey);
+    }
+    
+    return executed;
+  } finally {
+    // 确保释放执行锁
+    commandStateManager.releaseLock();
+  }
+};
+
+// 查找模型查看器引用的辅助函数
+const findModelViewerReference = () => {
+  console.log('尝试查找模型查看器引用...');
+  
+  // 方法1: 从父组件获取
+  try {
+    const parentElement = document.querySelector('.chat-dialog')?.parentElement;
+    if (parentElement) {
+      // Vue 3方式
+      const modelViewer = parentElement.__vue__?.refs?.modelViewer || 
+                          parentElement.__vue__?.setupState?.modelViewerRef?.value;
+      if (modelViewer) {
+        console.log('从父组件获取到ModelViewer引用');
+        return modelViewer;
+      }
+    }
+  } catch (e) {
+    console.error('从父组件获取模型查看器引用失败:', e);
+  }
+  
+  // 方法2: 直接从DOM获取
+  try {
+    const modelViewerElement = document.querySelector('.model-container')?.firstElementChild;
+    if (modelViewerElement && modelViewerElement.__vue__) {
+      console.log('从DOM直接获取到ModelViewer引用');
+      return modelViewerElement.__vue__;
+    }
+  } catch (e) {
+    console.error('从DOM获取模型查看器引用失败:', e);
+  }
+  
+  // 方法3: 通过全局变量获取
+  try {
+    if (window.__scene && window.__camera && window.__controls) {
+      console.log('从全局THREE.js对象识别到ModelViewer');
+      // 尝试返回window对象上可能存在的ModelViewer实例
+      if (window.modelViewer) {
+        return window.modelViewer;
+      }
+      // 如果找不到直接的引用，尝试通过全局方法判断
+      if (typeof window.zoomModel === 'function' &&
+          typeof window.rotateModel === 'function' &&
+          typeof window.focusModel === 'function') {
+        console.log('找到全局模型操作方法，返回代理对象');
+        // 创建一个代理对象，将全局方法包装起来
+        return {
+          commandQueue: [],
+          executeQueuedCommands: () => {
+            console.log('使用全局方法执行队列命令');
+            return true;
+          },
+          zoomModel: window.zoomModel,
+          rotateModel: window.rotateModel,
+          focusModel: window.focusModel,
+          resetModel: window.resetModel
+        };
+      }
+    }
+  } catch (e) {
+    console.error('从全局THREE.js对象获取模型查看器引用失败:', e);
+  }
+  
+  // 方法4: 获取canvas元素但正确处理
+  try {
+    const canvas = document.getElementById('modelViewer');
+    if (canvas) {
+      console.log('找到modelViewer canvas元素');
+      
+      // 通过父元素向上寻找Vue组件实例
+      let element = canvas;
+      while (element && !element.__vue__) {
+        element = element.parentElement;
+      }
+      
+      if (element && element.__vue__) {
+        console.log('从canvas父元素找到ModelViewer组件实例');
+        return element.__vue__;
+      }
+      
+      // 如果找不到组件实例，但全局有操作方法，创建代理对象
+      if (typeof window.zoomModel === 'function' || 
+          typeof window.rotateModel === 'function') {
+        console.log('找到canvas元素并有全局方法，返回代理对象');
+        return {
+          commandQueue: [],
+          executeQueuedCommands: () => {
+            console.log('canvas代理：使用全局方法执行队列命令');
+            return true;
+          },
+          zoomModel: typeof window.zoomModel === 'function' ? window.zoomModel : null,
+          rotateModel: typeof window.rotateModel === 'function' ? window.rotateModel : null,
+          focusModel: typeof window.focusModel === 'function' ? window.focusModel : null,
+          resetModel: typeof window.resetModel === 'function' ? window.resetModel : null
+        };
+      }
+      
+      // 返回null以避免返回canvas元素
+      return null;
+    }
+  } catch (e) {
+    console.error('通过canvas查找模型查看器引用失败:', e);
+  }
+  
+  // 方法5: 使用全局对象
+  try {
+    if (window.app && typeof window.app.zoomComponent === 'function') {
+      console.log('使用window.app对象');
+      return {
+        commandQueue: [],
+        executeQueuedCommands: () => {
+          console.log('window.app代理：使用全局方法执行队列命令');
+          return true;
+        },
+        zoomModel: (params) => window.app.zoomComponent(null, params.scale),
+        rotateModel: (params) => window.app.rotateComponent(null, params.angle, params.direction),
+        focusModel: (params) => window.app.focusOnComponent(params.target),
+        resetModel: () => window.app.resetModel ? window.app.resetModel() : false
+      };
+    }
+  } catch (e) {
+    console.error('使用全局app对象获取模型查看器引用失败:', e);
+  }
+  
+  console.warn('无法找到模型查看器引用');
+  return null;
+};
+
+// 尝试直接执行操作
+const tryExecuteDirectOperations = (modelViewer) => {
+  // 从会话存储中获取最后请求的操作类型
+  const lastOpType = sessionStorage.getItem('last_mcp_operation_type');
+  if (!lastOpType) return;
+  
+  console.log(`尝试直接执行最后请求的操作: ${lastOpType}`);
+  
+  // 检查是否使用全局window对象上的方法
+  if (lastOpType === 'zoom' && typeof window.zoomModel === 'function') {
+    const scale = parseFloat(sessionStorage.getItem('requested_scale') || '1.5');
+    console.log(`尝试使用全局zoomModel: scale=${scale}`);
+    try {
+      window.zoomModel({ scale });
+      return true;
+    } catch (e) {
+      console.error('使用全局zoomModel失败:', e);
+    }
+  }
+  
+  if (lastOpType === 'rotate' && typeof window.rotateModel === 'function') {
+    const angle = parseInt(sessionStorage.getItem('requested_angle') || '45');
+    const direction = sessionStorage.getItem('requested_direction') || 'left';
+    console.log(`尝试使用全局rotateModel: angle=${angle}, direction=${direction}`);
+    try {
+      window.rotateModel({ direction, angle });
+      return true;
+    } catch (e) {
+      console.error('使用全局rotateModel失败:', e);
+    }
+  }
+  
+  if (lastOpType === 'focus' && typeof window.focusModel === 'function') {
+    const target = sessionStorage.getItem('requested_target') || 'center';
+    console.log(`尝试使用全局focusModel: target=${target}`);
+    try {
+      window.focusModel({ target });
+      return true;
+    } catch (e) {
+      console.error('使用全局focusModel失败:', e);
+    }
+  }
+  
+  if (lastOpType === 'reset' && typeof window.resetModel === 'function') {
+    console.log(`尝试使用全局resetModel`);
+    try {
+      window.resetModel();
+      return true;
+    } catch (e) {
+      console.error('使用全局resetModel失败:', e);
+    }
+  }
+  
+  // 根据操作类型调用不同方法
+  if (!modelViewer) return false;
+  
+  switch(lastOpType.toLowerCase()) {
+    case 'rotate':
+      const angle = parseInt(sessionStorage.getItem('requested_angle') || '45');
+      const direction = sessionStorage.getItem('requested_direction') || 'left';
+      
+      if (modelViewer.rotateComponent) {
+        console.log(`直接执行旋转操作: 角度=${angle}, 方向=${direction}`);
+        modelViewer.rotateComponent(null, angle, direction);
+        return true;
+      }
+      break;
+      
+    case 'zoom':
+      const scale = parseFloat(sessionStorage.getItem('requested_scale') || '1.5');
+      
+      if (modelViewer.zoomComponent) {
+        console.log(`直接执行缩放操作: 比例=${scale}`);
+        modelViewer.zoomComponent(null, scale);
+        return true;
+      }
+      break;
+      
+    case 'focus':
+      const target = sessionStorage.getItem('requested_target') || 'center';
+      
+      if (modelViewer.focusOnComponent) {
+        console.log(`直接执行聚焦操作: 目标=${target}`);
+        modelViewer.focusOnComponent(target);
+        return true;
+      }
+      break;
+      
+    case 'reset':
+      if (modelViewer.resetModel) {
+        console.log('直接执行重置操作');
+        modelViewer.resetModel();
+        return true;
+      }
+      break;
+  }
+  
+  return false;
 };
 
 // 快速检测操作类型
@@ -227,10 +678,20 @@ const detectOperation = (message: string) => {
     // 检测方向
     const direction = message.includes('右') ? 'right' : 'left';
     
-    // 保存用户请求的角度和方向到sessionStorage
+    // 保存用户请求的角度和方向到sessionStorage，确保其他组件可以访问
     sessionStorage.setItem('requested_angle', angle.toString());
     sessionStorage.setItem('requested_direction', direction);
     console.log(`检测到旋转角度: ${angle}°, 方向: ${direction}，已保存到sessionStorage`);
+    
+    // 添加额外的日志用于调试
+    console.log('保存旋转参数到全局', {angle, direction});
+    
+    // 保存到全局对象，确保整个应用可以访问
+    window.lastRequestedRotation = {
+      angle,
+      direction,
+      timestamp: Date.now()
+    };
     
     parameters = {
       direction: direction,
@@ -257,6 +718,10 @@ const detectOperation = (message: string) => {
     };
   } else if (message.includes('重置') || message.includes('复位')) {
     operation = 'reset';
+  }
+  
+  if (operation) {
+    console.log(`检测到操作: ${operation}，参数:`, parameters);
   }
   
   return operation ? { operation, parameters } : null;
@@ -604,17 +1069,17 @@ onMounted(() => {
     checkMCPConnection();
   }, 1000);
   
-  // 声明变量避免未定义
-  let statusCheckInterval: number;
-  let mcpCheckInterval: number;
+  // 声明变量并初始化为0或null以避免未定义错误
+  let statusCheckInterval = 0;
+  let mcpCheckInterval = 0;
   
   // 然后每5秒检查一次MCP服务状态，确保状态及时更新
-  statusCheckInterval = setInterval(() => {
+  statusCheckInterval = window.setInterval(() => {
     checkMCPServerStatus();
   }, 5000);
   
   // 每10秒检查一次MCP连接状态
-  mcpCheckInterval = setInterval(() => {
+  mcpCheckInterval = window.setInterval(() => {
     checkMCPConnection();
   }, 10000);
   
@@ -625,8 +1090,8 @@ onMounted(() => {
   
   // 组件卸载时清除定时器
   onBeforeUnmount(() => {
-    clearInterval(statusCheckInterval);
-    clearInterval(mcpCheckInterval);
+    if (statusCheckInterval) window.clearInterval(statusCheckInterval);
+    if (mcpCheckInterval) window.clearInterval(mcpCheckInterval);
     
     // 清除全局API
     if (window && window.enableMCPMode) {
@@ -650,13 +1115,29 @@ const handleMessage = async (message: string) => {
     time: formatTime(new Date())
   });
   
-  // 清空输入框
-  userMessage.value = '';
+  // 清空输入框 - 修复这里对userMessage的引用
+  if (userMessage && typeof userMessage.value !== 'undefined') {
+    userMessage.value = '';
+  }
   
   // 显示加载状态
   isLoading.value = true;
   
   try {
+    // 检测操作指令
+    const detectedOperation = detectOperation(message);
+    
+    // 如果检测到操作指令，先注册但不立即执行
+    let pendingCommandKey = null;
+    if (detectedOperation) {
+      pendingCommandKey = commandStateManager.registerCommand(
+        detectedOperation.operation, 
+        detectedOperation.parameters
+      );
+      sessionStorage.setItem('pending_command_key', pendingCommandKey);
+      console.log(`已注册操作指令: ${detectedOperation.operation}，等待AI响应后执行`);
+    }
+    
     // 尝试从自然语言生成MCP命令
     if (isMCPAvailable.value) {
       // 发送自然语言命令请求
@@ -699,17 +1180,41 @@ const handleMessage = async (message: string) => {
             }
           }
           
-          // 延迟执行操作
-          console.log('延迟执行模型操作，等待AI回复显示...');
-          await delay(1000);
-          
-          // 延迟后发出操作事件
-          console.log('现在执行模型操作:', result.action);
-          emit('executeAction', {
-            type: 'mcp',
-            operation: result.action,
-            parameters: result.parameters
-          });
+          // 延迟执行操作，获取执行锁
+          if (commandStateManager.acquireLock()) {
+            try {
+              console.log('延迟执行模型操作，等待AI回复显示...');
+              await delay(1000);
+              
+              // 检查是否近期已执行过相似命令
+              if (!commandStateManager.isCommandExecuted(result.action, result.parameters)) {
+                // 延迟后发出操作事件
+                console.log('现在执行模型操作:', result.action);
+                emit('executeAction', {
+                  type: result.action,
+                  operation: result.action,
+                  parameters: result.parameters
+                });
+                
+                // 标记命令已执行
+                if (pendingCommandKey) {
+                  commandStateManager.markAsExecuted(pendingCommandKey);
+                } else {
+                  // 注册并标记新命令为已执行
+                  const newCommandKey = commandStateManager.registerCommand(
+                    result.action,
+                    result.parameters
+                  );
+                  commandStateManager.markAsExecuted(newCommandKey);
+                }
+              } else {
+                console.log(`近期已执行过相似的${result.action}命令，跳过执行`);
+              }
+            } finally {
+              // 释放执行锁
+              commandStateManager.releaseLock();
+            }
+          }
           
           isLoading.value = false;
           return;
@@ -743,7 +1248,7 @@ const sendToAI = async (message: string) => {
     
     // 发送API请求
     const response = await fetch(
-      'http://localhost:8089/api/chat',  // 添加缺失的API URL
+      'http://localhost:8089/api/chat',
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -760,7 +1265,7 @@ const sendToAI = async (message: string) => {
     // 添加AI响应到聊天记录
     chatHistory.push({
       role: 'assistant',
-      content: result.response || result.message || '无响应',
+      content: result.response || result.message || result.text || '无响应',
       time: formatTime(new Date())
     });
     

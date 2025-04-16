@@ -17,6 +17,27 @@ export class WebSocketManager {
     this.reconnectAttempts = new Map();
     this.messageHandlers = new Map();
     this.pendingCommands = new Map();
+    
+    // 控制日志级别，默认只显示错误
+    this.logLevel = config.logLevel || 'error'; // 'debug'|'info'|'warn'|'error'|'none'
+  }
+  
+  // 日志函数，根据设置的级别输出
+  log(level, ...args) {
+    const levels = {
+      debug: 0,
+      info: 1,
+      warn: 2,
+      error: 3,
+      none: 4
+    };
+    
+    if (levels[level] >= levels[this.logLevel]) {
+      if (level === 'debug') console.debug(...args);
+      else if (level === 'info') console.log(...args);
+      else if (level === 'warn') console.warn(...args);
+      else if (level === 'error') console.error(...args);
+    }
   }
 
   // 初始化连接
@@ -26,21 +47,19 @@ export class WebSocketManager {
       if (this.connections.has(endpoint)) {
         const existingWs = this.connections.get(endpoint);
         if (existingWs && existingWs.readyState === WebSocket.OPEN) {
-          console.log(`WebSocket连接 ${endpoint} 已存在且活跃，复用现有连接`);
           return existingWs;
         } else if (existingWs) {
-          console.log(`WebSocket连接 ${endpoint} 已存在但不活跃，断开旧连接`);
           this.disconnect(endpoint);
         }
       }
 
-      console.log(`正在创建新WebSocket连接: ${endpoint}`);
+      this.log('info', `正在创建新WebSocket连接: ${endpoint}`);
       const ws = new WebSocket(`${this.config.wsUrl}${endpoint}`);
       
       // 设置连接超时
       const connectionTimeout = setTimeout(() => {
         if (ws.readyState !== WebSocket.OPEN) {
-          console.error(`WebSocket连接超时: ${endpoint}`);
+          this.log('error', `WebSocket连接超时: ${endpoint}`);
           ws.close();
         }
       }, 5000);
@@ -50,7 +69,7 @@ export class WebSocketManager {
 
       return new Promise((resolve, reject) => {
         ws.onopen = () => {
-          console.log(`WebSocket连接成功: ${endpoint}`);
+          this.log('info', `WebSocket连接成功: ${endpoint}`);
           this.reconnectAttempts.set(endpoint, 0);
           clearTimeout(connectionTimeout); // 清除连接超时
           
@@ -60,7 +79,7 @@ export class WebSocketManager {
               try {
                 ws.send(JSON.stringify({ type: 'heartbeat', timestamp: new Date().toISOString() }));
               } catch (error) {
-                console.warn(`发送心跳消息失败: ${endpoint}`, error);
+                this.log('warn', `发送心跳消息失败: ${endpoint}`);
               }
             } else {
               clearInterval(heartbeatInterval);
@@ -73,13 +92,13 @@ export class WebSocketManager {
           resolve(ws);
         };
         ws.onerror = (error) => {
-          console.error(`WebSocket连接失败: ${endpoint}`, error);
+          this.log('error', `WebSocket连接失败: ${endpoint}`);
           clearTimeout(connectionTimeout); // 清除连接超时
           reject(error);
         };
       });
     } catch (error) {
-      console.error(`WebSocket连接错误: ${endpoint}`, error);
+      this.log('error', `WebSocket连接错误: ${endpoint}`);
       this.handleReconnect(endpoint);
       throw error;
     }
@@ -96,7 +115,7 @@ export class WebSocketManager {
   handleMessage(event, endpoint) {
     try {
       const data = JSON.parse(event.data);
-      console.log(`收到WebSocket消息 (${endpoint}):`, data);
+      this.log('debug', `收到WebSocket消息 (${endpoint}):`, data);
       
       // 调用所有消息处理器，首先进行广播
       const handlers = this.messageHandlers.get(endpoint) || [];
@@ -117,7 +136,7 @@ export class WebSocketManager {
       
       // 如果找到命令ID，并且有对应的待响应命令
       if (commandId && this.pendingCommands.has(commandId)) {
-        console.log(`找到命令响应 (ID: ${commandId})`, data);
+        this.log('debug', `找到命令响应 (ID: ${commandId})`);
         
         const pendingCommand = this.pendingCommands.get(commandId);
         const { resolve } = pendingCommand;
@@ -132,7 +151,7 @@ export class WebSocketManager {
         
         // 计算响应时间
         const responseTime = Date.now() - pendingCommand.timestamp;
-        console.log(`命令响应 (ID: ${commandId}, 耗时: ${responseTime}ms, 状态: ${isSuccess ? '成功' : '失败'})`, data);
+        this.log('debug', `命令响应 (ID: ${commandId}, 耗时: ${responseTime}ms, 状态: ${isSuccess ? '成功' : '失败'})`);
         
         // 无论成功失败都调用resolve，让应用层自行处理结果
         // MCP服务设计是即使命令执行有问题也返回成功，前端需要自行处理显示
@@ -141,12 +160,12 @@ export class WebSocketManager {
       } else if (data.type === 'mcp.command' || data.type === 'mcp.response') {
         // 还没有相应的pending命令，但是命令响应类型，可能是广播或者异步响应
         const msgId = data.id || data.command_id || '未知ID';
-        console.log(`收到MCP命令或响应，但没有对应的pending命令 (ID: ${msgId})`, data);
+        this.log('debug', `收到MCP命令或响应，但没有对应的pending命令 (ID: ${msgId})`);
         // 不做特殊处理，让应用层自己处理
       }
     } catch (error) {
-      console.error(`消息处理错误 (${endpoint})`, error);
-      console.log('原始消息:', event.data);
+      this.log('error', `消息处理错误 (${endpoint})`);
+      this.log('debug', '原始消息:', event.data);
       try {
         // 尝试作为纯文本消息处理
         const handlers = this.messageHandlers.get(endpoint) || [];
@@ -159,26 +178,26 @@ export class WebSocketManager {
 
   // 处理连接关闭
   handleClose(endpoint) {
-    console.log(`WebSocket连接关闭: ${endpoint}`);
+    this.log('info', `WebSocket连接关闭: ${endpoint}`);
     this.connections.delete(endpoint);
     this.handleReconnect(endpoint);
   }
 
   // 处理连接错误
   handleError(error, endpoint) {
-    console.error(`WebSocket错误: ${endpoint}`, error);
+    this.log('error', `WebSocket错误: ${endpoint}`);
   }
 
   // 处理重连
   async handleReconnect(endpoint) {
     const attempts = this.reconnectAttempts.get(endpoint) || 0;
     if (attempts >= this.config.maxReconnectAttempts) {
-      console.error(`WebSocket重连失败: ${endpoint} - 已达到最大重试次数`);
+      this.log('error', `WebSocket重连失败: ${endpoint} - 已达到最大重试次数`);
       return;
     }
 
     this.reconnectAttempts.set(endpoint, attempts + 1);
-    console.log(`尝试重连 WebSocket: ${endpoint} - 第 ${attempts + 1} 次`);
+    this.log('info', `尝试重连 WebSocket: ${endpoint} - 第 ${attempts + 1} 次`);
 
     setTimeout(() => {
       this.connect(endpoint).catch(() => {
@@ -210,7 +229,7 @@ export class WebSocketManager {
       }
       return true;
     } catch (error) {
-      console.error(`发送消息失败: ${endpoint}`, error);
+      this.log('error', `发送消息失败: ${endpoint}`);
       throw error;
     }
   }
@@ -236,7 +255,7 @@ export class WebSocketManager {
   async sendCommand(endpoint, command) {
     const ws = this.connections.get(endpoint);
     if (!ws || ws.readyState !== WebSocket.OPEN) {
-      console.error(`WebSocket连接未就绪 (${endpoint}): readyState=${ws ? ws.readyState : 'undefined'}`);
+      this.log('error', `WebSocket连接未就绪 (${endpoint}): readyState=${ws ? ws.readyState : 'undefined'}`);
       throw new Error(`WebSocket连接未就绪: ${endpoint}`);
     }
 
@@ -255,7 +274,7 @@ export class WebSocketManager {
           try {
             commandObj = JSON.parse(command);
           } catch (e) {
-            console.warn('命令不是有效的JSON字符串，将尝试作为普通消息发送');
+            this.log('warn', '命令不是有效的JSON字符串，将尝试作为普通消息发送');
             ws.send(command);
             return resolve({ success: true, message: '消息已发送' });
           }
@@ -283,7 +302,7 @@ export class WebSocketManager {
           commandId = commandObj.id;
         }
         
-        console.log(`准备发送WebSocket命令 (ID: ${commandId}, 类型: ${commandObj.type || 'unknown'})`, commandObj);
+        this.log('debug', `准备发送WebSocket命令 (ID: ${commandId})`);
         
         // 存储待响应的命令
         this.pendingCommands.set(commandId, { 
@@ -295,13 +314,13 @@ export class WebSocketManager {
         
         // 转换为JSON并发送
         const jsonString = JSON.stringify(commandObj);
-        console.log(`发送WebSocket命令 (${endpoint}, 长度: ${jsonString.length}字节)`);
+        this.log('debug', `发送WebSocket命令 (${endpoint}, 长度: ${jsonString.length}字节)`);
         ws.send(jsonString);
         
         // 设置超时处理
         setTimeout(() => {
           if (this.pendingCommands.has(commandId)) {
-            console.warn(`WebSocket命令超时 (ID: ${commandId})`, commandObj);
+            this.log('warn', `WebSocket命令超时 (ID: ${commandId})`);
             // 不删除命令，允许晚到的响应仍然处理
             // 但仍然返回超时结果
             resolve({ 
@@ -313,7 +332,7 @@ export class WebSocketManager {
           }
         }, 5000); // 5秒超时
       } catch (error) {
-        console.error('发送命令失败:', error);
+        this.log('error', '发送命令失败');
         reject(error);
       }
     });
@@ -336,12 +355,12 @@ export class WebSocketManager {
         }
         ws.close();
       } catch (e) {
-        console.warn(`关闭WebSocket连接出错: ${endpoint}`, e);
+        this.log('warn', `关闭WebSocket连接出错: ${endpoint}`);
       }
       
       this.connections.delete(endpoint);
       this.messageHandlers.delete(endpoint);
-      console.log(`已断开WebSocket连接: ${endpoint}`);
+      this.log('info', `已断开WebSocket连接: ${endpoint}`);
     }
   }
 
@@ -356,6 +375,22 @@ export class WebSocketManager {
   getConnectionStatus(endpoint) {
     const ws = this.connections.get(endpoint);
     return ws ? ws.readyState : WebSocket.CLOSED;
+  }
+
+  // 检查连接状态并尝试连接，如果状态良好则返回true，否则尝试重连
+  async checkConnection(endpoint) {
+    try {
+      if (this.isConnectionActive(endpoint)) {
+        return true;
+      }
+      
+      this.log('info', `连接${endpoint}未活跃，尝试重新连接`);
+      await this.connect(endpoint);
+      return this.isConnectionActive(endpoint);
+    } catch (error) {
+      this.log('error', `检查/恢复连接失败 (${endpoint})`);
+      return false;
+    }
   }
 
   // 创建新的命令构建器实例

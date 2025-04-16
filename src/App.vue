@@ -2,6 +2,13 @@
 import { ref, onMounted, onBeforeUnmount } from 'vue';
 import ModelViewer from './components/ModelViewer.vue';
 import ChatDialog from './components/ChatDialog.vue';
+import CommandStateManager from './utils/CommandStateManager';
+
+// 创建命令状态管理器实例
+const commandStateManager = new CommandStateManager({
+  commandTTL: 5000,  // 5秒内相似命令被视为重复
+  lockTimeout: 8000  // 命令锁超时8秒
+});
 
 // 引用模型查看器组件 (Reference to model viewer component)
 const modelViewerRef = ref<InstanceType<typeof ModelViewer> | null>(null);
@@ -209,190 +216,266 @@ const openChatDialog = () => {
   chatDialogVisible.value = true;
 };
 
-// 处理聊天操作
-const handleChatAction = async (action) => {
-  console.log('收到聊天操作:', action);
+// 处理AI聊天窗口触发的执行动作
+const handleExecuteAction = (action) => {
+  console.log('收到执行操作请求:', action);
   
-  if (!modelViewerRef.value) {
-    console.error('模型查看器未初始化，无法执行操作');
-    return;
-  }
-  
-  // 获取操作类型
+  // 确保action对象格式统一
   const operationType = action.type || action.operation;
-  const params = action.parameters || action.params || {};
-  
-  // 检查是否是重复操作
-  const lastOperationType = sessionStorage.getItem('last_mcp_operation_type');
-  const lastOperationTime = parseInt(sessionStorage.getItem('last_mcp_operation_time') || '0');
-  const currentTime = Date.now();
-  const timeDifference = currentTime - lastOperationTime;
-  
-  // 如果是相同类型的操作且时间差小于3秒，认为是重复操作
-  if (lastOperationType === operationType && timeDifference < 3000) {
-    console.log(`检测到重复操作: ${operationType}，跳过执行`);
-    // 清除标记，防止影响后续操作
-    sessionStorage.removeItem('last_mcp_operation_type');
-    sessionStorage.removeItem('last_mcp_operation_time');
+  const params = action.params || action.parameters || {};
+
+  // 如果操作类型不存在，无法执行
+  if (!operationType) {
+    console.error('无法执行操作: 未指定操作类型');
     return;
   }
-
-  // 记录当前操作，防止重复执行
-  sessionStorage.setItem('last_mcp_operation_type', operationType);
-  sessionStorage.setItem('last_mcp_operation_time', currentTime.toString());
-
-  // 检查操作参数
-  if (operationType === 'rotate') {
-    // 确保旋转角度正确，如果请求是45度但被设置为30度，则修正
-    if (params.angle === 30 && sessionStorage.getItem('requested_angle')) {
-      const requestedAngle = parseInt(sessionStorage.getItem('requested_angle'));
-      console.log(`修正旋转角度: 从${params.angle}°改为${requestedAngle}°`);
-      params.angle = requestedAngle;
-    }
-    console.log(`准备执行旋转操作: 方向=${params.direction}, 角度=${params.angle}°`);
-  }
-
-  // 创建MCP命令，但不立即执行
-  const mcpCommand = {
-    type: 'mcp.command',
-    action: operationType,
-    parameters: params,
-    id: `cmd_${Date.now()}_${Math.floor(Math.random() * 10000)}`,
-    timestamp: new Date().toISOString(),
-    source: 'ai_response' // 标记来源为AI响应
-  };
   
-  console.log('准备发送MCP命令:', mcpCommand);
-  
-  // 将命令添加到模型查看器的命令队列
-  if (modelViewerRef.value && typeof modelViewerRef.value.commandQueue !== 'undefined') {
-    console.log('添加命令到模型查看器的命令队列');
-    modelViewerRef.value.commandQueue.value.push(mcpCommand);
-  } else {
-    // 如果无法直接访问队列，则通过WebSocket发送命令
-    try {
-      // 使用WebSocket发送MCP命令
-      const mcpResult = await wsManager.sendCommand('/ws/command', mcpCommand);
-      console.log('MCP命令发送结果:', mcpResult);
-    } catch (error) {
-      // MCP命令发送失败，降级到本地操作
-      console.error('MCP命令发送失败，原因:', error);
-      console.warn('使用本地操作作为备选方案');
-      
-      // 以下是本地操作的代码，作为MCP操作失败时的备选方案
-      executeLocalOperation(operationType, params);
-    }
+  // 支持的操作类型
+  const validOperations = ['rotate', 'zoom', 'focus', 'reset'];
+  if (!validOperations.includes(operationType)) {
+    console.error(`不支持的操作类型: ${operationType}`);
+    return;
   }
   
-  // 请求执行队列中的命令
-  if (modelViewerRef.value && typeof modelViewerRef.value.executeQueuedCommands === 'function') {
-    console.log('App.vue: 即将执行队列中的命令');
-    // 短暂延迟，确保命令已进入队列
+  // 检查是否近期已执行过相似命令
+  if (commandStateManager.isCommandExecuted(operationType, params)) {
+    console.log(`近期已执行过相似的${operationType}命令，跳过执行`);
+    return;
+  }
+  
+  // 尝试获取执行锁，最多重试2次
+  executeWithRetry(action, 0, 2);
+};
+
+// 带有重试限制的执行函数
+const executeWithRetry = (action, retryCount, maxRetries) => {
+  const operationType = action.type || action.operation;
+  const params = action.params || action.parameters || {};
+  
+  if (retryCount > maxRetries) {
+    console.error(`已达到最大重试次数(${maxRetries})，放弃执行操作: ${operationType}`);
+    return;
+  }
+  
+  // 尝试获取执行锁
+  if (!commandStateManager.acquireLock()) {
+    console.log(`无法获取命令执行锁，这是第${retryCount}次尝试，稍后重试...`);
+    // 延迟重试，每次增加延迟时间
     setTimeout(() => {
-      modelViewerRef.value.executeQueuedCommands();
-    }, 100);
+      executeWithRetry(action, retryCount + 1, maxRetries);
+    }, 1000 * (retryCount + 1)); // 延迟时间随重试次数增加
+    return;
   }
   
-  // 操作完成后清除存储的请求角度
-  if (operationType === 'rotate') {
-    sessionStorage.removeItem('requested_angle');
+  try {
+    // 注册新命令
+    const commandKey = commandStateManager.registerCommand(
+      operationType,
+      params
+    );
+    
+    // 根据操作类型执行相应的方法
+    const modelViewer = modelViewerRef.value;
+    if (modelViewer) {
+      let result = false;
+      
+      switch(operationType) {
+        case 'rotate':
+          result = modelViewer.rotateComponent(
+            null, 
+            params.angle || 45, 
+            params.direction || 'left'
+          );
+          break;
+          
+        case 'zoom':
+          result = modelViewer.zoomComponent(null, params.scale || 1.5);
+          break;
+          
+        case 'focus':
+          result = modelViewer.focusOnComponent(
+            params.target || params.objectName || 'center'
+          );
+          break;
+          
+        case 'reset':
+          result = modelViewer.resetModel();
+          break;
+      }
+      
+      // 如果执行成功，标记命令为已执行
+      if (result) {
+        commandStateManager.markAsExecuted(commandKey);
+        console.log(`操作${operationType}执行完成`);
+      } else {
+        console.warn(`操作${operationType}执行失败，尝试使用全局方法`);
+        // 尝试全局方法
+        const globalResult = executeGlobalMethod(operationType, params);
+        if (globalResult) {
+          commandStateManager.markAsExecuted(commandKey);
+        }
+      }
+    } else {
+      console.warn('找不到模型查看器引用，尝试使用全局方法');
+      // 尝试使用全局方法
+      const globalResult = executeGlobalMethod(operationType, params);
+      if (globalResult) {
+        commandStateManager.markAsExecuted(commandKey);
+      }
+    }
+  } finally {
+    // 确保释放执行锁
+    commandStateManager.releaseLock();
   }
 };
 
-// 本地执行操作的函数
-const executeLocalOperation = (operationType, params) => {
-  // 处理旋转操作
-  if (operationType === 'rotate') {
-    const direction = params.direction || 'left';
-    // 使用传入的角度参数，确保与MCP命令使用相同的角度
-    const angle = params.angle || 45;
-    
-    console.log(`执行本地旋转操作: 方向=${direction}, 角度=${angle}`);
-    
-    // 优先使用全局window.rotateModel函数
-    if (typeof window.rotateModel === 'function') {
-      window.rotateModel({direction, angle});
-    }
-    // 其次检查modelViewerRef中的方法
-    else if (modelViewerRef.value && typeof modelViewerRef.value.rotateModel === 'function') {
-      modelViewerRef.value.rotateModel({direction, angle});
-    }
-    // 再检查app全局对象中的方法
-    else if (window.app && typeof window.app.rotateComponent === 'function') {
-      window.app.rotateComponent(null, angle, direction);
-    }
-    else {
-      console.error('找不到可用的旋转方法');
-    }
+// 使用全局方法执行操作
+const executeGlobalMethod = (operationType, params) => {
+  let executed = false;
+  
+  switch(operationType) {
+    case 'rotate':
+      if (typeof window.rotateModel === 'function') {
+        window.rotateModel(params);
+        executed = true;
+      }
+      break;
+      
+    case 'zoom':
+      if (typeof window.zoomModel === 'function') {
+        window.zoomModel(params);
+        executed = true;
+      }
+      break;
+      
+    case 'focus':
+      if (typeof window.focusModel === 'function') {
+        window.focusModel(params);
+        executed = true;
+      }
+      break;
+      
+    case 'reset':
+      if (typeof window.resetModel === 'function') {
+        window.resetModel();
+        executed = true;
+      }
+      break;
   }
-  // 处理缩放操作
-  else if (operationType === 'zoom') {
-    const scale = params.scale || 1.5;
-    
-    console.log(`执行本地缩放操作: 比例=${scale}`);
-    
-    // 优先使用全局window.zoomModel函数
-    if (typeof window.zoomModel === 'function') {
-      window.zoomModel({scale});
-    }
-    // 其次检查modelViewerRef中的方法
-    else if (modelViewerRef.value && typeof modelViewerRef.value.zoomModel === 'function') {
-      modelViewerRef.value.zoomModel({scale});
-    }
-    // 再检查全局对象中的其他可能方法
-    else if (window.scaleModel && typeof window.scaleModel === 'function') {
-      window.scaleModel(scale);
-    }
-    else if (window.app && typeof window.app.zoomComponent === 'function') {
-      window.app.zoomComponent(null, scale);
-    }
-    else {
-      console.error('找不到可用的缩放方法');
-    }
+  
+  return executed;
+};
+
+// 获取ModelViewer引用
+const getModelViewerReference = () => {
+  // 方法1: 从refs获取
+  if (modelViewerRef.value) {
+    console.log('从refs获取到ModelViewer引用');
+    return modelViewerRef.value;
   }
-  // 处理聚焦操作
-  else if (operationType === 'focus') {
-    const target = params.target || 'center';
-    
-    console.log(`执行本地聚焦操作: 目标=${target}`);
-    
-    // 优先使用全局window.focusModel函数
-    if (typeof window.focusModel === 'function') {
-      window.focusModel({target});
-    }
-    // 其次检查modelViewerRef中的方法
-    else if (modelViewerRef.value && typeof modelViewerRef.value.focusModel === 'function') {
-      modelViewerRef.value.focusModel({target});
-    }
-    // 再检查其他可能方法
-    else if (typeof window.focusOnModel === 'function') {
-      window.focusOnModel({target});
-    }
-    else if (window.app && typeof window.app.focusModel === 'function') {
-      window.app.focusModel({target});
-    }
-    else {
-      console.error('找不到可用的聚焦方法');
-    }
+  
+  // 方法2: 从全局对象获取
+  if (window.modelViewer) {
+    console.log('从全局对象获取到ModelViewer引用');
+    return window.modelViewer;
   }
-  // 处理重置操作
-  else if (operationType === 'reset') {
-    console.log('执行本地重置视图操作');
+  
+  // 方法3: 从DOM中查找
+  return findModelViewerInDOM();
+};
+
+// 从DOM中查找ModelViewer
+const findModelViewerInDOM = () => {
+  try {
+    // 尝试直接从组件容器获取
+    const modelContainer = document.querySelector('.model-container');
+    if (modelContainer && modelContainer.firstElementChild && modelContainer.firstElementChild.__vue__) {
+      console.log('从DOM中找到ModelViewer组件');
+      return modelContainer.firstElementChild.__vue__;
+    }
     
-    // 优先使用全局window.resetModel函数
-    if (typeof window.resetModel === 'function') {
-      window.resetModel();
+    // 尝试从父元素获取
+    const appContainer = document.querySelector('.app-container');
+    if (appContainer && appContainer.__vue__) {
+      const modelViewer = appContainer.__vue__.refs?.modelViewer || 
+                          appContainer.__vue__.setupState?.modelViewerRef?.value;
+      
+      if (modelViewer) {
+        console.log('从App组件获取到ModelViewer引用');
+        return modelViewer;
+      }
     }
-    // 其次检查modelViewerRef中的方法
-    else if (modelViewerRef.value && typeof modelViewerRef.value.resetModel === 'function') {
-      modelViewerRef.value.resetModel();
-    }
-    else {
-      console.error('找不到可用的重置方法');
-    }
+  } catch (error) {
+    console.error('从DOM查找ModelViewer时出错:', error);
   }
-  else {
-    console.warn(`未知操作类型: ${operationType}`);
+  
+  console.warn('无法在DOM中找到ModelViewer组件');
+  return null;
+};
+
+// 直接执行具体操作
+const executeDirectOperation = (modelViewer, action) => {
+  const operation = action.operation || action.type || action.action;
+  const parameters = action.parameters || action.params || {};
+  
+  console.log(`直接执行${operation}操作，参数:`, parameters);
+  
+  if (!operation) {
+    console.error('操作类型未定义');
+    return;
+  }
+  
+  switch (operation.toLowerCase()) {
+    case 'rotate':
+      if (typeof modelViewer.rotateModel === 'function') {
+        const angle = parseInt(parameters?.angle || 45);
+        const direction = parameters?.direction || 'left';
+        console.log(`执行旋转: 角度=${angle}, 方向=${direction}`);
+        modelViewer.rotateModel({ angle, direction });
+      } else if (typeof modelViewer.rotateComponent === 'function') {
+        modelViewer.rotateComponent(null, parameters?.angle, parameters?.direction);
+      } else {
+        console.error('ModelViewer不支持旋转操作');
+      }
+      break;
+      
+    case 'zoom':
+      if (typeof modelViewer.zoomModel === 'function') {
+        const scale = parseFloat(parameters?.scale || 1.5);
+        console.log(`执行缩放: 比例=${scale}`);
+        modelViewer.zoomModel({ scale });
+      } else if (typeof modelViewer.zoomComponent === 'function') {
+        modelViewer.zoomComponent(null, parameters?.scale);
+      } else {
+        console.error('ModelViewer不支持缩放操作');
+      }
+      break;
+      
+    case 'focus':
+      if (typeof modelViewer.focusModel === 'function') {
+        const target = parameters?.target || 'center';
+        console.log(`执行聚焦: 目标=${target}`);
+        modelViewer.focusModel({ target });
+      } else if (typeof modelViewer.focusOnComponent === 'function') {
+        modelViewer.focusOnComponent(parameters?.target);
+      } else {
+        console.error('ModelViewer不支持聚焦操作');
+      }
+      break;
+      
+    case 'reset':
+      if (typeof modelViewer.resetModel === 'function') {
+        console.log('执行重置');
+        modelViewer.resetModel();
+      } else if (typeof modelViewer.executeLocalReset === 'function') {
+        modelViewer.executeLocalReset();
+      } else {
+        console.error('ModelViewer不支持重置操作');
+      }
+      break;
+      
+    default:
+      console.error(`未知操作类型: ${operation}`);
   }
 };
 
@@ -405,20 +488,40 @@ onMounted(async () => {
   // 初始化MCP WebSocket连接
   initWebSocket();
   
-  // 添加事件监听器，执行队列中的命令
-  window.addEventListener('execute-queued-commands', () => {
+  // 创建事件处理函数引用，以便能正确移除它们
+  const executeQueuedCommandsHandler = () => {
     if (modelViewerRef.value && typeof modelViewerRef.value.executeQueuedCommands === 'function') {
       console.log('App.vue: 响应execute-queued-commands事件，执行队列命令');
       modelViewerRef.value.executeQueuedCommands();
     }
-  });
+  };
+  
+  // 为测试按钮创建处理函数引用
+  const rotateLeftHandler = () => rotateThroughMCP('left', 15);
+  const rotateRightHandler = () => rotateThroughMCP('right', 15);
+  const zoomInHandler = () => zoomThroughMCP(1.2);
+  const zoomOutHandler = () => zoomThroughMCP(0.8);
+  const resetHandler = () => resetThroughMCP();
+  
+  // 添加事件监听器，执行队列中的命令
+  window.addEventListener('execute-queued-commands', executeQueuedCommandsHandler);
   
   // 添加测试按钮的事件处理
-  document.querySelector('#rotate-left-btn')?.addEventListener('click', () => rotateThroughMCP('left', 15));
-  document.querySelector('#rotate-right-btn')?.addEventListener('click', () => rotateThroughMCP('right', 15));
-  document.querySelector('#zoom-in-btn')?.addEventListener('click', () => zoomThroughMCP(1.2));
-  document.querySelector('#zoom-out-btn')?.addEventListener('click', () => zoomThroughMCP(0.8));
-  document.querySelector('#reset-btn')?.addEventListener('click', () => resetThroughMCP());
+  document.querySelector('#rotate-left-btn')?.addEventListener('click', rotateLeftHandler);
+  document.querySelector('#rotate-right-btn')?.addEventListener('click', rotateRightHandler);
+  document.querySelector('#zoom-in-btn')?.addEventListener('click', zoomInHandler);
+  document.querySelector('#zoom-out-btn')?.addEventListener('click', zoomOutHandler);
+  document.querySelector('#reset-btn')?.addEventListener('click', resetHandler);
+  
+  // 将事件处理函数存储在window对象上，以便在卸载时能访问到它们
+  window.__appEventHandlers = {
+    executeQueuedCommandsHandler,
+    rotateLeftHandler,
+    rotateRightHandler,
+    zoomInHandler,
+    zoomOutHandler,
+    resetHandler
+  };
 });
 
 // 组件卸载前执行
@@ -426,12 +529,15 @@ onBeforeUnmount(() => {
   // 断开WebSocket连接
   wsManager.disconnect();
   
+  // 获取之前保存的事件处理函数引用
+  const handlers = window.__appEventHandlers || {};
+  
   // 移除事件监听器
-  window.removeEventListener('execute-queued-commands', () => {});
+  window.removeEventListener('execute-queued-commands', handlers.executeQueuedCommandsHandler);
   
   // 安全地清除定时器
   if (typeof statusCheckInterval === 'number') {
-    clearInterval(statusCheckInterval);
+    window.clearInterval(statusCheckInterval);
     statusCheckInterval = null;
   }
   
@@ -446,11 +552,14 @@ onBeforeUnmount(() => {
   }
   
   // 移除测试按钮的事件处理
-  document.querySelector('#rotate-left-btn')?.removeEventListener('click', () => {});
-  document.querySelector('#rotate-right-btn')?.removeEventListener('click', () => {});
-  document.querySelector('#zoom-in-btn')?.removeEventListener('click', () => {});
-  document.querySelector('#zoom-out-btn')?.removeEventListener('click', () => {});
-  document.querySelector('#reset-btn')?.removeEventListener('click', () => {});
+  document.querySelector('#rotate-left-btn')?.removeEventListener('click', handlers.rotateLeftHandler);
+  document.querySelector('#rotate-right-btn')?.removeEventListener('click', handlers.rotateRightHandler);
+  document.querySelector('#zoom-in-btn')?.removeEventListener('click', handlers.zoomInHandler);
+  document.querySelector('#zoom-out-btn')?.removeEventListener('click', handlers.zoomOutHandler);
+  document.querySelector('#reset-btn')?.removeEventListener('click', handlers.resetHandler);
+  
+  // 清除引用
+  delete window.__appEventHandlers;
 });
 
 // 移除或注释掉checkStatus函数
@@ -688,7 +797,7 @@ const resetThroughMCP = () => {
     
     <ChatDialog 
       v-model:modelVisible="chatDialogVisible"
-      @executeAction="handleChatAction"
+      @executeAction="handleExecuteAction"
     />
   </div>
 </template>
