@@ -516,6 +516,51 @@ const enableModelControlMode = () => {
   console.log('已强制启用模型操作模式，之前的状态为:', prevStatus);
 };
 
+// 检查MCP客户端连接状态
+const checkMCPConnection = async () => {
+  // 检查MCP客户端是否已初始化
+  if (!mcpClient.value) {
+    console.log('MCP客户端未初始化，尝试初始化');
+    try {
+      // 添加必要的配置信息
+      const mcpConfig = {
+        serverUrl: 'http://localhost:9000',
+        wsUrl: 'ws://localhost:9000/ws/mcp',
+        autoReconnect: true,
+        reconnectDelay: 3000,
+        maxReconnectAttempts: 5,
+        pingInterval: 30000,
+        clientType: 'web_ui',
+        onMessage: (message) => {
+          console.log('收到MCP消息:', message);
+        },
+        onStatusChange: (status) => {
+          console.log('MCP状态变更为:', status);
+        }
+      };
+      
+      mcpClient.value = getMCPClient(mcpConfig);
+      console.log('MCP客户端初始化成功');
+    } catch (error) {
+      console.error('MCP客户端初始化失败:', error);
+      return false;
+    }
+  }
+  
+  // 检查连接状态
+  if (mcpClient.value && (!mcpClient.value.connected || mcpClient.value.connected.value === false)) {
+    console.log('MCP客户端未连接，尝试连接');
+    try {
+      mcpClient.value.connect();
+    } catch (error) {
+      console.error('MCP客户端连接失败:', error);
+      return false;
+    }
+  }
+  
+  return true;
+};
+
 // 组件挂载后 (After component mount)
 onMounted(() => {
   scrollToBottom();
@@ -524,8 +569,30 @@ onMounted(() => {
   
   // 初始化MCP客户端
   try {
-    mcpClient.value = getMCPClient();
+    // 添加必要的配置信息
+    const mcpConfig = {
+      serverUrl: 'http://localhost:9000',
+      wsUrl: 'ws://localhost:9000/ws/mcp',
+      autoReconnect: true,
+      reconnectDelay: 3000,
+      maxReconnectAttempts: 5,
+      pingInterval: 30000,
+      clientType: 'web_ui',
+      onMessage: (message) => {
+        console.log('收到MCP消息:', message);
+      },
+      onStatusChange: (status) => {
+        console.log('MCP状态变更为:', status);
+      }
+    };
+    
+    mcpClient.value = getMCPClient(mcpConfig);
     console.log('MCP客户端初始化成功');
+    
+    // 建立连接
+    if (mcpClient.value) {
+      mcpClient.value.connect();
+    }
   } catch (error) {
     console.error('MCP客户端初始化失败:', error);
   }
@@ -533,15 +600,23 @@ onMounted(() => {
   // 先进行一次快速检查，确保服务状态尽快更新
   setTimeout(() => {
     checkMCPServerStatus();
+    // 同时检查MCP连接
+    checkMCPConnection();
   }, 1000);
   
   // 声明变量避免未定义
   let statusCheckInterval: number;
+  let mcpCheckInterval: number;
   
   // 然后每5秒检查一次MCP服务状态，确保状态及时更新
   statusCheckInterval = setInterval(() => {
     checkMCPServerStatus();
   }, 5000);
+  
+  // 每10秒检查一次MCP连接状态
+  mcpCheckInterval = setInterval(() => {
+    checkMCPConnection();
+  }, 10000);
   
   // 暴露API到全局窗口
   if (window) {
@@ -551,6 +626,7 @@ onMounted(() => {
   // 组件卸载时清除定时器
   onBeforeUnmount(() => {
     clearInterval(statusCheckInterval);
+    clearInterval(mcpCheckInterval);
     
     // 清除全局API
     if (window && window.enableMCPMode) {
